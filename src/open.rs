@@ -20,6 +20,9 @@ pub struct OpenOptions {
     /// Block until the editor is closed (`code --wait`); over the channel
     /// this requires a single path or --diff.
     pub wait: bool,
+    /// Tunnel remote-loopback URLs to this machine (ssh -L, daemon-side)
+    /// before opening them.
+    pub proxy: bool,
     pub paths: Vec<String>,
 }
 
@@ -151,6 +154,7 @@ fn parse_shim_args(args: Vec<String>) -> Result<OpenOptions> {
         force_goto: false,
         diff: None,
         wait: false,
+        proxy: false,
         paths: Vec::new(),
     };
     let mut diff_flag = false;
@@ -192,6 +196,9 @@ fn send_plan(opts: OpenOptions) -> Result<()> {
     if opts.wait && opts.paths.iter().any(|p| is_url(p)) {
         bail!("--wait is not supported for URLs");
     }
+    if opts.proxy && (opts.diff.is_some() || !opts.paths.iter().all(|p| is_url(p))) {
+        bail!("--proxy applies to http(s) URLs only");
+    }
     let sock = std::env::var("SSH_AUTH_SOCK").context(
         "SSH_AUTH_SOCK is not set — backchannel needs an ssh session with agent forwarding \
          pointed at the backchannel daemon (see README)",
@@ -219,7 +226,7 @@ fn send_plan(opts: OpenOptions) -> Result<()> {
         for p in &opts.paths {
             if is_url(p) {
                 let msg = format!("opening {p} in your local browser");
-                requests.push((Action::Url { url: p.clone() }, msg));
+                requests.push((Action::Url { url: p.clone(), proxy: opts.proxy }, msg));
                 continue;
             }
             let (kind, path, line, col) = classify_target(p, opts.force_goto);
@@ -262,9 +269,12 @@ fn send_plan(opts: OpenOptions) -> Result<()> {
                     Reply::Failure => bail!("unexpected agent failure while waiting"),
                 }
             }
-            Reply::Success(authority) => {
-                println!("{msg}{}", describe_authority(&authority))
-            }
+            Reply::Success(authority) => match (&authority, opts.proxy) {
+                (Some((final_url, target)), true) => {
+                    println!("opening {final_url} in your local browser (tunneled to {target})")
+                }
+                _ => println!("{msg}{}", describe_authority(&authority)),
+            },
             Reply::ExtensionFailure(reason) => bail!("daemon error: {reason}"),
             Reply::Failure => bail!(
                 "the agent behind SSH_AUTH_SOCK is not the backchannel daemon — this looks like \

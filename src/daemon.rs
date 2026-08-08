@@ -3,13 +3,17 @@
 //! the actual ssh-agent) or a backchannel extension message (ping / open /
 //! shutdown) from the remote wrapper or another backchannel process.
 
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::io;
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -17,6 +21,22 @@ use crate::proto::*;
 use crate::{launch, logging, paths, peer, ssh_argv};
 
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// ssh -L children keyed by local port. The registry is the ground truth
+/// `back status` / `back proxy list` report from.
+struct Tunnel {
+    alias: String,
+    remote_port: u16,
+    child: Child,
+}
+
+static TUNNELS: OnceLock<Mutex<HashMap<u16, Tunnel>>> = OnceLock::new();
+
+fn tunnels() -> &'static Mutex<HashMap<u16, Tunnel>> {
+    TUNNELS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+static DAEMONIZED: AtomicBool = AtomicBool::new(false);
 
 enum Existing {
     None,
@@ -160,6 +180,7 @@ fn daemonize() -> Result<()> {
             _child => libc::_exit(0),
         }
         libc::setsid();
+        DAEMONIZED.store(true, Ordering::Relaxed);
         let devnull = libc::open(c"/dev/null".as_ptr(), libc::O_RDWR);
         if devnull >= 0 {
             libc::dup2(devnull, 0);
@@ -180,6 +201,14 @@ extern "C" fn on_term(_sig: libc::c_int) {
     if let Some(p) = CLEANUP_PATH.get() {
         unsafe {
             libc::unlink(p.as_ptr());
+        }
+    }
+    // Daemonized (post-setsid) we lead our own process group containing the
+    // ssh -L tunnel children — take them down with us. Never in foreground
+    // mode, where the group may include the spawning shell or test runner.
+    if DAEMONIZED.load(Ordering::Relaxed) {
+        unsafe {
+            libc::kill(0, libc::SIGTERM);
         }
     }
     unsafe { libc::_exit(0) }
@@ -239,9 +268,29 @@ fn handle_client(
                     "shutdown requested by pid {}",
                     peer.map(|p| p.pid.to_string()).unwrap_or_else(|| "?".into())
                 ));
+                kill_all_tunnels();
                 let _ = write_frame(&mut stream, &success_frame());
                 let _ = std::fs::remove_file(sock_path);
                 std::process::exit(0);
+            }
+            Some((name, _)) if name == EXT_TUNNELS => {
+                let mut reg = tunnels().lock().unwrap();
+                prune_dead(&mut reg);
+                let entries: Vec<TunnelEntry> = reg
+                    .iter()
+                    .map(|(lp, t)| TunnelEntry {
+                        alias: t.alias.clone(),
+                        local_port: *lp,
+                        remote_port: t.remote_port,
+                        pid: t.child.id(),
+                    })
+                    .collect();
+                drop(reg);
+                write_frame(&mut stream, &tunnels_reply(&entries))?;
+            }
+            Some((name, data)) if name == EXT_PROXY_STOP => {
+                let reply = handle_proxy_stop(data);
+                write_frame(&mut stream, &reply)?;
             }
             Some((name, data)) if name == EXT_OPEN => {
                 handle_open(data, peer, &mut stream)?;
@@ -308,6 +357,198 @@ fn proxy_roundtrip(
     unreachable!()
 }
 
+fn prune_dead(reg: &mut HashMap<u16, Tunnel>) {
+    reg.retain(|lp, t| match t.child.try_wait() {
+        Ok(None) => true,
+        _ => {
+            logging::warn(format!(
+                "tunnel localhost:{lp} -> {}:{} died; removing",
+                t.alias, t.remote_port
+            ));
+            false
+        }
+    });
+}
+
+fn kill_tunnel(local_port: u16, t: &mut Tunnel) {
+    logging::info(format!(
+        "stopping tunnel localhost:{local_port} -> {}:{} (ssh pid {})",
+        t.alias,
+        t.remote_port,
+        t.child.id()
+    ));
+    let _ = t.child.kill();
+    let _ = t.child.wait();
+}
+
+fn kill_all_tunnels() {
+    let mut reg = tunnels().lock().unwrap();
+    for (lp, t) in reg.iter_mut() {
+        kill_tunnel(*lp, t);
+    }
+    reg.clear();
+}
+
+fn handle_proxy_stop(data: &[u8]) -> Vec<u8> {
+    let port = Cursor::new(data).u32().unwrap_or(0) as u16;
+    let mut reg = tunnels().lock().unwrap();
+    prune_dead(&mut reg);
+    let summary = if port == 0 {
+        let n = reg.len();
+        for (lp, t) in reg.iter_mut() {
+            kill_tunnel(*lp, t);
+        }
+        reg.clear();
+        format!("stopped {n} tunnel(s)")
+    } else if let Some(mut t) = reg.remove(&port) {
+        kill_tunnel(port, &mut t);
+        format!("stopped tunnel localhost:{port} -> {}:{}", t.alias, t.remote_port)
+    } else {
+        return extension_failure(&format!("no tunnel on local port {port}"));
+    };
+    let mut reply = success_frame();
+    put_str(&mut reply, &summary);
+    reply
+}
+
+/// Establish (or reuse) an ssh -L tunnel to `alias`, returning the local
+/// port. Same (alias, remote_port) reuses; our own tunnel on the preferred
+/// port with a different target is replaced (last request wins); a foreign
+/// process on the port pushes us to an ephemeral one.
+fn ensure_tunnel(alias: &str, remote_port: u16) -> Result<u16> {
+    let mut reg = tunnels().lock().unwrap();
+    prune_dead(&mut reg);
+    if let Some((lp, _)) = reg
+        .iter()
+        .find(|(_, t)| t.alias == alias && t.remote_port == remote_port)
+    {
+        return Ok(*lp);
+    }
+    let preferred = remote_port;
+    if let Some(mut old) = reg.remove(&preferred) {
+        logging::info(format!(
+            "port {preferred} held for {}:{}; replacing with {alias}:{remote_port}",
+            old.alias, old.remote_port
+        ));
+        kill_tunnel(preferred, &mut old);
+    }
+    let local = if port_available(preferred) {
+        preferred
+    } else {
+        ephemeral_port()?
+    };
+
+    let mut child = spawn_tunnel(alias, local, remote_port)?;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if TcpStream::connect(("127.0.0.1", local)).is_ok() {
+            break;
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            bail!(
+                "ssh tunnel to {alias} exited ({status}) before forwarding came up — check that \
+                 `ssh {alias}` works non-interactively"
+            );
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("ssh tunnel to {alias} did not come up within 15s");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    logging::info(format!(
+        "tunnel established: localhost:{local} -> {alias}:{remote_port} (ssh pid {})",
+        child.id()
+    ));
+    reg.insert(
+        local,
+        Tunnel {
+            alias: alias.to_string(),
+            remote_port,
+            child,
+        },
+    );
+    Ok(local)
+}
+
+fn spawn_tunnel(alias: &str, local: u16, remote: u16) -> Result<Child> {
+    let ssh = std::env::var_os("BACKCHANNEL_SSH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("ssh"));
+    // BatchMode: a headless daemon must fail fast, never hang on a prompt.
+    // ExitOnForwardFailure: a failed bind must kill the child (detectable),
+    // not leave a connected ssh with no forwarding (ssh's silent default).
+    Command::new(&ssh)
+        .arg("-N")
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg("-L")
+        .arg(format!("{local}:127.0.0.1:{remote}"))
+        .arg(alias)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .with_context(|| format!("spawning {} for the tunnel", ssh.display()))
+}
+
+fn port_available(p: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", p)).is_ok()
+}
+
+fn ephemeral_port() -> Result<u16> {
+    Ok(TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
+}
+
+/// Minimal URL split: (scheme, host, port, path-and-after). Enough for
+/// loopback validation and port rewriting; not a general URL parser.
+fn split_url(url: &str) -> Option<(String, String, u16, String)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let scheme = scheme.to_ascii_lowercase();
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let (h, p) = bracketed.split_once(']')?;
+        (h.to_string(), p.strip_prefix(':').and_then(|p| p.parse().ok()))
+    } else if let Some((h, p)) = authority.rsplit_once(':') {
+        match p.parse::<u16>() {
+            Ok(pn) => (h.to_string(), Some(pn)),
+            Err(_) => (authority.to_string(), None),
+        }
+    } else {
+        (authority.to_string(), None)
+    };
+    let default = if scheme == "https" { 443 } else { 80 };
+    Some((scheme, host, port.unwrap_or(default), tail.to_string()))
+}
+
+fn is_loopback(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
+}
+
+/// Tunnel then open: returns (final URL opened, "alias:port" description).
+fn proxy_open(url: &str, alias: &str) -> Result<(String, String)> {
+    let (scheme, host, port, tail) =
+        split_url(url).with_context(|| format!("unparseable URL {url:?}"))?;
+    if !is_loopback(&host) {
+        bail!(
+            "--proxy only forwards the remote host's own loopback; {host:?} is not \
+             localhost/127.0.0.1/::1"
+        );
+    }
+    let local = ensure_tunnel(alias, port)?;
+    let final_url = if local == port {
+        url.to_string()
+    } else {
+        format!("{scheme}://localhost:{local}{tail}")
+    };
+    launch::open_url(&final_url)?;
+    Ok((final_url, format!("{alias}:{port}")))
+}
+
 fn handle_copy(data: &[u8]) -> Result<String> {
     let req = CopyRequest::decode(data).context("decoding copy request")?;
     if req.data.len() > crate::clipboard::MAX_COPY_BYTES {
@@ -341,8 +582,8 @@ fn handle_open(
         Err(e) => return fail(stream, &e),
     };
 
-    // URLs go to the local browser, not VS Code; no authority to resolve.
-    if let Action::Url { url } = &req.action {
+    // URLs go to the local browser, not VS Code.
+    if let Action::Url { url, proxy } = &req.action {
         if req.wait {
             return fail(stream, &anyhow::anyhow!("--wait is not supported for URLs"));
         }
@@ -351,6 +592,19 @@ fn handle_open(
             // A remote must not be able to trigger arbitrary local scheme
             // handlers (file:, ssh:, app-registered schemes, ...).
             return fail(stream, &anyhow::anyhow!("refusing non-http(s) URL {url:?}"));
+        }
+        if *proxy {
+            let (alias, how) = resolve_alias(peer, &req);
+            return match proxy_open(url, &alias) {
+                Ok((final_url, target)) => {
+                    logging::info(format!(
+                        "proxy url {} -> {} (alias '{}' via {})",
+                        url, final_url, alias, how
+                    ));
+                    Ok(write_frame(stream, &success_with_authority(&final_url, &target))?)
+                }
+                Err(e) => fail(stream, &e),
+            };
         }
         logging::info(format!("open url {} from host '{}'", url, req.hostname));
         return match launch::open_url(url) {
@@ -409,7 +663,8 @@ fn describe(action: &Action) -> String {
             format!("open {} {}:{}:{}", kind.as_str(), path, line, col)
         }
         Action::Diff { left, right } => format!("diff {} <-> {}", left, right),
-        Action::Url { url } => format!("open url {}", url),
+        Action::Url { url, proxy: false } => format!("open url {}", url),
+        Action::Url { url, proxy: true } => format!("proxy url {}", url),
     }
 }
 
@@ -475,7 +730,38 @@ fn parse_ssh_connection(s: &str) -> Option<(String, u16)> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_ssh_connection;
+    use super::{is_loopback, parse_ssh_connection, split_url};
+
+    #[test]
+    fn splits_urls() {
+        assert_eq!(
+            split_url("http://localhost:8000/docs?q=1"),
+            Some(("http".into(), "localhost".into(), 8000, "/docs?q=1".into()))
+        );
+        assert_eq!(
+            split_url("https://127.0.0.1"),
+            Some(("https".into(), "127.0.0.1".into(), 443, "".into()))
+        );
+        assert_eq!(
+            split_url("http://localhost"),
+            Some(("http".into(), "localhost".into(), 80, "".into()))
+        );
+        assert_eq!(
+            split_url("http://[::1]:3000/x"),
+            Some(("http".into(), "::1".into(), 3000, "/x".into()))
+        );
+        assert_eq!(split_url("not a url"), None);
+    }
+
+    #[test]
+    fn loopback_hosts() {
+        assert!(is_loopback("localhost"));
+        assert!(is_loopback("LOCALHOST"));
+        assert!(is_loopback("127.0.0.1"));
+        assert!(is_loopback("::1"));
+        assert!(!is_loopback("example.com"));
+        assert!(!is_loopback("192.168.1.10"));
+    }
 
     #[test]
     fn parses_ssh_connection() {

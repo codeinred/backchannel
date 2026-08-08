@@ -87,6 +87,21 @@ fn encode_open_file(path: &str, wait: bool, hostname: &str, user: &str, ssh_conn
     b
 }
 
+/// Encode an open@backchannel v4 request for a URL action.
+fn encode_url(url: &str, proxy: bool, hostname: &str) -> Vec<u8> {
+    let mut b = Vec::new();
+    put_u32(&mut b, 4);
+    put_str(&mut b, "default");
+    put_u32(&mut b, 0); // wait
+    put_str(&mut b, "url");
+    put_str(&mut b, url);
+    put_u32(&mut b, proxy as u32);
+    put_str(&mut b, hostname);
+    put_str(&mut b, "testuser");
+    put_str(&mut b, "");
+    b
+}
+
 // ---- test environment ----
 
 struct TestEnv {
@@ -183,6 +198,14 @@ impl TestEnv {
 impl Drop for TestEnv {
     fn drop(&mut self) {
         if let Some(mut d) = self.daemon.take() {
+            // Graceful first: the daemon reaps its tunnel children on a
+            // shutdown request; a bare SIGKILL would leak them (and a leaked
+            // listener can poison later runs' ports).
+            if let Ok(mut s) = UnixStream::connect(self.sock()) {
+                let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+                send_frame(&mut s, &ext_msg("shutdown@backchannel", &[]));
+                let _ = read_frame(&mut s);
+            }
             let _ = d.kill();
             let _ = d.wait();
         }
@@ -450,16 +473,10 @@ fn urls_open_in_local_browser() {
     // Non-http(s) schemes must be refused by the daemon, not opened.
     let mut s = UnixStream::connect(env.sock()).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let mut b = Vec::new();
-    put_u32(&mut b, 4);
-    put_str(&mut b, "default");
-    put_u32(&mut b, 0);
-    put_str(&mut b, "url");
-    put_str(&mut b, "file:///etc/passwd");
-    put_str(&mut b, "h");
-    put_str(&mut b, "u");
-    put_str(&mut b, "");
-    send_frame(&mut s, &ext_msg("open@backchannel", &b));
+    send_frame(
+        &mut s,
+        &ext_msg("open@backchannel", &encode_url("file:///etc/passwd", false, "h")),
+    );
     let reply = read_frame(&mut s).unwrap();
     assert_eq!(reply.first(), Some(&28), "expected extension failure, got {reply:?}");
 
@@ -593,6 +610,155 @@ fn copy_rejects_oversized_and_binary_junk() {
         "{out:?}"
     );
     assert!(!env.dir.join("clip.bin").exists(), "nothing should have been copied");
+}
+
+/// A stand-in for `ssh -N -L`: parses the -L spec, binds the local port,
+/// and accepts-and-closes forever. Lets tunnel lifecycle be tested with no
+/// network or real ssh.
+fn write_tunnel_stub(env: &TestEnv) -> String {
+    let stub = env.dir.join("ssh-stub.sh");
+    let script = r#"#!/bin/sh
+echo "$@" >> "$(dirname "$0")/ssh.log"
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-L" ]; then spec="$a"; fi
+  prev="$a"
+done
+exec python3 -c '
+import socket, sys
+port = int(sys.argv[1].split(":")[0])
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("127.0.0.1", port))
+s.listen(5)
+while True:
+    c, _ = s.accept()
+    c.close()
+' "$spec"
+"#;
+    std::fs::write(&stub, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    stub.to_string_lossy().into_owned()
+}
+
+#[test]
+fn proxy_tunnels_replaces_and_stops() {
+    let mut env = TestEnv::new("tun");
+    env.write_stub("");
+    let ssh_stub = write_tunnel_stub(&env);
+    let opener = env.dir.join("opener.sh");
+    std::fs::write(
+        &opener,
+        "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/opener.log\"\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let opener_str = opener.to_string_lossy().into_owned();
+    env.start_daemon(&[
+        ("BACKCHANNEL_SSH", ssh_stub.as_str()),
+        ("BACKCHANNEL_OPENER", opener_str.as_str()),
+    ]);
+
+    // Establish a tunnel via the normal client path, on a port that is
+    // verifiably free right now (fixed ports poison reruns if anything leaks).
+    let port = {
+        let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        l.local_addr().unwrap().port()
+    };
+    let url = format!("http://localhost:{port}/x");
+    let out = env.open(&["--proxy", &url]);
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("tunneled to"), "{stdout}");
+    let ssh_log = std::fs::read_to_string(env.dir.join("ssh.log")).unwrap_or_else(|e| {
+        let listing: Vec<_> = std::fs::read_dir(&env.dir)
+            .unwrap()
+            .flatten()
+            .map(|d| d.file_name().to_string_lossy().into_owned())
+            .collect();
+        let dlog = std::fs::read_to_string(env.dir.join("daemon.log")).unwrap_or_default();
+        panic!("no ssh.log ({e}); dir: {listing:?}\ndaemon.log:\n{dlog}");
+    });
+    assert!(ssh_log.contains(&format!("-L {port}:127.0.0.1:{port}")), "{ssh_log}");
+    // The opener is spawned asynchronously after the reply — poll for it.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let log = std::fs::read_to_string(env.dir.join("opener.log")).unwrap_or_default();
+        if log.contains(&url) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "opener never saw {url}; log: {log}");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // Same target again: reused, not respawned.
+    let out = env.open(&["--proxy", &url]);
+    assert!(out.status.success(), "{out:?}");
+    let ssh_log = std::fs::read_to_string(env.dir.join("ssh.log")).unwrap();
+    assert_eq!(ssh_log.matches("-L").count(), 1, "tunnel should be reused:\n{ssh_log}");
+
+    // A different host wanting the same port: ours gets torn down, theirs
+    // takes over.
+    let mut s = UnixStream::connect(env.sock()).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(20))).unwrap();
+    send_frame(
+        &mut s,
+        &ext_msg("open@backchannel", &encode_url(&url, true, "otherhost")),
+    );
+    let reply = read_frame(&mut s).unwrap();
+    assert_eq!(reply.first(), Some(&SSH_AGENT_SUCCESS), "{reply:?}");
+    let ssh_log = std::fs::read_to_string(env.dir.join("ssh.log")).unwrap();
+    assert_eq!(ssh_log.matches("-L").count(), 2, "expected respawn:\n{ssh_log}");
+    assert!(ssh_log.contains("otherhost"), "{ssh_log}");
+
+    // list shows the new owner; stop tears it down and frees the port.
+    let out = Command::new(BIN)
+        .args(["proxy", "list"])
+        .env("SSH_AUTH_SOCK", env.sock())
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&out.stdout);
+    assert!(listing.contains("otherhost"), "{listing}");
+    assert!(!listing.contains("testhost"), "{listing}");
+
+    let out = Command::new(BIN)
+        .args(["proxy", "stop", &port.to_string()])
+        .env("SSH_AUTH_SOCK", env.sock())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("stopped"), "{out:?}");
+
+    let out = Command::new(BIN)
+        .args(["proxy", "list"])
+        .env("SSH_AUTH_SOCK", env.sock())
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).contains("no active tunnels"), "{out:?}");
+
+    // Port actually released.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "port {port} not released");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn proxy_rejects_non_loopback() {
+    let mut env = TestEnv::new("proxyloop");
+    env.write_stub("");
+    let ssh_stub = write_tunnel_stub(&env);
+    env.start_daemon(&[("BACKCHANNEL_SSH", ssh_stub.as_str())]);
+    let out = env.open(&["--proxy", "http://internal.example.com:8080/"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("loopback"),
+        "{out:?}"
+    );
+    assert!(!env.dir.join("ssh.log").exists(), "no tunnel should have been attempted");
 }
 
 #[test]

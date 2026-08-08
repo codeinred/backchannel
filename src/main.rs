@@ -7,6 +7,7 @@ mod open;
 mod paths;
 mod peer;
 mod proto;
+mod proxy;
 mod ssh_argv;
 mod status;
 
@@ -53,6 +54,9 @@ enum Command {
         /// Block until the editor is closed (single path or --diff)
         #[arg(short = 'w', long)]
         wait: bool,
+        /// Tunnel a remote loopback URL here (ssh -L) before opening it
+        #[arg(long)]
+        proxy: bool,
         /// Files, folders, or http(s) URLs to open; positions as
         /// path:line[:col] jump there
         #[arg(required_unless_present = "diff")]
@@ -64,8 +68,27 @@ enum Command {
         /// File to copy; omit to read from stdin
         file: Option<String>,
     },
+    /// Inspect or stop the daemon's ssh -L tunnels
+    Proxy {
+        #[command(subcommand)]
+        action: ProxyAction,
+    },
     /// Report what backchannel can see from here (daemon, sockets, forwarding)
     Status,
+}
+
+#[derive(Subcommand)]
+enum ProxyAction {
+    /// List active tunnels
+    List,
+    /// Stop a tunnel by its local port, or all of them
+    Stop {
+        /// Local port of the tunnel to stop
+        port: Option<u16>,
+        /// Stop every tunnel
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -82,7 +105,7 @@ fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Daemon { replace, foreground } => daemon::run(replace, foreground),
-        Command::Open { new_window, reuse_window, goto, diff, wait, paths } => {
+        Command::Open { new_window, reuse_window, goto, diff, wait, proxy, paths } => {
             open::run(open::OpenOptions {
                 window: if new_window {
                     proto::WindowMode::New
@@ -98,10 +121,15 @@ fn main() -> Result<()> {
                     (left, right)
                 }),
                 wait,
+                proxy,
                 paths,
             })
         }
         Command::Copy { file } => copy::run(file),
+        Command::Proxy { action } => match action {
+            ProxyAction::List => proxy::list(),
+            ProxyAction::Stop { port, all } => proxy::stop(port, all),
+        },
         Command::Status => status::run(),
     }
 }

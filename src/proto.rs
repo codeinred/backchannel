@@ -15,6 +15,8 @@ pub const EXT_PING: &str = "ping@backchannel";
 pub const EXT_OPEN: &str = "open@backchannel";
 pub const EXT_SHUTDOWN: &str = "shutdown@backchannel";
 pub const EXT_COPY: &str = "copy@backchannel";
+pub const EXT_TUNNELS: &str = "tunnels@backchannel";
+pub const EXT_PROXY_STOP: &str = "proxy-stop@backchannel";
 
 /// Far above any legitimate agent message; bounds memory against a
 /// misbehaving peer. Sized for clipboard payloads (images) with headroom.
@@ -193,8 +195,9 @@ pub enum Action {
     },
     Diff { left: String, right: String },
     /// Open in the local default browser (http/https only, enforced
-    /// daemon-side).
-    Url { url: String },
+    /// daemon-side). With `proxy`, the daemon first establishes an ssh -L
+    /// tunnel to the requesting host so a remote loopback URL is reachable.
+    Url { url: String, proxy: bool },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,9 +238,10 @@ impl OpenRequest {
                 put_str(&mut b, left);
                 put_str(&mut b, right);
             }
-            Action::Url { url } => {
+            Action::Url { url, proxy } => {
                 put_str(&mut b, "url");
                 put_str(&mut b, url);
+                put_u32(&mut b, *proxy as u32);
             }
         }
         put_str(&mut b, &self.hostname);
@@ -291,7 +295,10 @@ impl OpenRequest {
                         left: c.str()?,
                         right: c.str()?,
                     },
-                    "url" => Action::Url { url: c.str()? },
+                    "url" => Action::Url {
+                        url: c.str()?,
+                        proxy: c.u32()? != 0,
+                    },
                     other => return Err(bad(format!("bad action {other:?}"))),
                 };
                 let hostname = c.str()?;
@@ -351,6 +358,45 @@ impl CopyRequest {
             data: payload,
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelEntry {
+    pub alias: String,
+    pub local_port: u16,
+    pub remote_port: u16,
+    pub pid: u32,
+}
+
+pub fn tunnels_reply(entries: &[TunnelEntry]) -> Vec<u8> {
+    let mut b = vec![SSH_AGENT_SUCCESS];
+    put_u32(&mut b, entries.len() as u32);
+    for e in entries {
+        put_str(&mut b, &e.alias);
+        put_u32(&mut b, e.local_port as u32);
+        put_u32(&mut b, e.remote_port as u32);
+        put_u32(&mut b, e.pid);
+    }
+    b
+}
+
+/// None when the frame isn't a tunnels reply (e.g. an older daemon).
+pub fn parse_tunnels_reply(frame: &[u8]) -> Option<Vec<TunnelEntry>> {
+    if frame.first() != Some(&SSH_AGENT_SUCCESS) {
+        return None;
+    }
+    let mut c = Cursor::new(&frame[1..]);
+    let n = c.u32().ok()?;
+    let mut out = Vec::with_capacity(n as usize);
+    for _ in 0..n {
+        out.push(TunnelEntry {
+            alias: c.str().ok()?,
+            local_port: c.u32().ok()? as u16,
+            remote_port: c.u32().ok()? as u16,
+            pid: c.u32().ok()?,
+        });
+    }
+    Some(out)
 }
 
 #[derive(Debug, Clone)]
