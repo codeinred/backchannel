@@ -8,7 +8,7 @@ convenient, and seamless on remotes you trust.
 # spawn vscode remote session on the host, and open ./vtz
 back code ./vtz
 
-# Open a file specific line/column
+# Open a file at a specific line/column
 back code src/main.cpp:127:32
 
 # copy files back to the host, and open with default program
@@ -17,14 +17,14 @@ back open vtz/flamegraph.svg
 # open in the browser on host
 back open https://example.com
 
-# forward port 8080 on the host to the remote, and then open
+# tunnels port 8080 on the remote to the host, and then open
 # on the host browser
 back open --proxy http://localhost:8080
 
 # Run a command, and copy the output to the host clipboard
 fd '\.h' | back copy
 
-# Copy on image into the host clipboard, from the remote
+# Copy an image into the host clipboard, from the remote
 back copy vtz/images/raw_benchmarks.png
 ```
 
@@ -44,7 +44,7 @@ On the remote `back` can automatically discover the appropriate channel via
   https://docs.github.com/en/authentication/connecting-to-github-with-ssh/using-ssh-agent-forwarding
 
 <details>
-<summary><bold>What is <code>ForwardAgent</code>?</bold></summary>
+<summary><b>What is <code>ForwardAgent</code>?</b></summary>
 
 [ForwardAgent] is a mechanism by which you can allow remote sessions to
 authenticate access with the keys on your local machine.
