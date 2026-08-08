@@ -16,6 +16,12 @@ pub const EXT_OPEN: &str = "open@backchannel";
 pub const EXT_SHUTDOWN: &str = "shutdown@backchannel";
 pub const EXT_COPY: &str = "copy@backchannel";
 pub const EXT_OPENFILE: &str = "openfile@backchannel";
+pub const EXT_PULL: &str = "pull@backchannel";
+
+/// First byte of an interim progress frame sent while the daemon pulls a
+/// file (before the final success/failure reply). Outside the agent
+/// protocol's type space on purpose — only our own clients ever see it.
+pub const BACKCHANNEL_PROGRESS_FRAME: u8 = 200;
 pub const EXT_TUNNELS: &str = "tunnels@backchannel";
 pub const EXT_PROXY_STOP: &str = "proxy-stop@backchannel";
 
@@ -400,6 +406,76 @@ impl OpenFileRequest {
             data: payload,
         })
     }
+}
+
+/// Ask the daemon to fetch a file itself (scp over a fresh ssh connection)
+/// instead of pushing bytes through the agent channel, whose tiny
+/// flow-control window caps bulk transfer. Carries the same alias-fallback
+/// material as OpenRequest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequest {
+    /// "open" (default app) or "copy" (clipboard).
+    pub disposition: String,
+    /// Absolute path on the requesting host.
+    pub path: String,
+    pub size: u64,
+    pub hostname: String,
+    pub user: String,
+    pub ssh_connection: String,
+}
+
+impl PullRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        put_u32(&mut b, 1); // pull protocol version
+        put_str(&mut b, &self.disposition);
+        put_str(&mut b, &self.path);
+        put_u32(&mut b, (self.size >> 32) as u32);
+        put_u32(&mut b, self.size as u32);
+        put_str(&mut b, &self.hostname);
+        put_str(&mut b, &self.user);
+        put_str(&mut b, &self.ssh_connection);
+        b
+    }
+
+    pub fn decode(data: &[u8]) -> io::Result<PullRequest> {
+        let mut c = Cursor::new(data);
+        let version = c.u32()?;
+        if version != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported pull@backchannel version {version}"),
+            ));
+        }
+        Ok(PullRequest {
+            disposition: c.str()?,
+            path: c.str()?,
+            size: ((c.u32()? as u64) << 32) | c.u32()? as u64,
+            hostname: c.str()?,
+            user: c.str()?,
+            ssh_connection: c.str()?,
+        })
+    }
+}
+
+pub fn progress_frame(done: u64, total: u64) -> Vec<u8> {
+    let mut b = vec![BACKCHANNEL_PROGRESS_FRAME];
+    put_u32(&mut b, (done >> 32) as u32);
+    put_u32(&mut b, done as u32);
+    put_u32(&mut b, (total >> 32) as u32);
+    put_u32(&mut b, total as u32);
+    b
+}
+
+/// Some((done, total)) when the frame is an interim progress report.
+pub fn parse_progress_frame(frame: &[u8]) -> Option<(u64, u64)> {
+    if frame.first() != Some(&BACKCHANNEL_PROGRESS_FRAME) {
+        return None;
+    }
+    let mut c = Cursor::new(&frame[1..]);
+    let done = ((c.u32().ok()? as u64) << 32) | c.u32().ok()? as u64;
+    let total = ((c.u32().ok()? as u64) << 32) | c.u32().ok()? as u64;
+    Some((done, total))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

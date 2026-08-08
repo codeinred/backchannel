@@ -118,19 +118,44 @@ fn send_open_verb(targets: Vec<String>, proxy: bool) -> Result<()> {
                 path.display()
             );
         }
+        let basename = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .with_context(|| format!("no filename in {}", path.display()))?;
+
+        // Large files: have the daemon pull over a real ssh connection —
+        // the agent channel's tiny window caps bulk at single-digit MiB/s.
+        if meta.len() >= pull_threshold() {
+            let path_str = path.to_string_lossy().into_owned();
+            match send_pull(&mut stream, "open", &path_str, meta.len(), &basename)? {
+                PullOutcome::Done(stats) => {
+                    match stats.summary() {
+                        Some(summary) => println!(
+                            "opening {basename} ({summary}) with the default app on your local machine"
+                        ),
+                        None => println!(
+                            "opening {basename} ({} bytes) with the default app on your local machine",
+                            meta.len()
+                        ),
+                    }
+                    continue;
+                }
+                PullOutcome::Fallback(reason) => {
+                    eprintln!("note: fast pull unavailable ({reason}); transferring inline");
+                }
+            }
+        }
+
         let data = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
         if data.len() > crate::clipboard::MAX_COPY_BYTES {
             bail!(
-                "{} is {} bytes, over the {} MiB transfer limit",
+                "{} is {} bytes, over the {} MiB inline transfer limit (and the daemon could \
+                 not pull it directly)",
                 path.display(),
                 data.len(),
                 crate::clipboard::MAX_COPY_BYTES / (1024 * 1024)
             );
         }
-        let basename = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .with_context(|| format!("no filename in {}", path.display()))?;
         let len = data.len();
         let req = OpenFileRequest {
             basename: basename.clone(),
@@ -163,6 +188,72 @@ fn send_open_verb(targets: Vec<String>, proxy: bool) -> Result<()> {
 fn is_url(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+/// Files at or above this ride a daemon-side scp pull (full link speed)
+/// instead of the agent channel (64KB flow-control window, ~single-digit
+/// MiB/s regardless of link).
+pub(crate) fn pull_threshold() -> u64 {
+    std::env::var("BACKCHANNEL_PULL_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4 * 1024 * 1024)
+}
+
+pub(crate) enum PullOutcome {
+    Done(crate::progress::TransferStats),
+    /// The daemon couldn't pull (no scp, auth needed a prompt, ...); the
+    /// caller should transfer inline instead.
+    Fallback(String),
+}
+
+/// Ask the daemon to scp the file itself, rendering its progress frames
+/// until the final reply.
+pub(crate) fn send_pull(
+    stream: &mut UnixStream,
+    disposition: &str,
+    path: &str,
+    size: u64,
+    label: &str,
+) -> Result<PullOutcome> {
+    let req = PullRequest {
+        disposition: disposition.into(),
+        path: path.into(),
+        size,
+        hostname: hostname(),
+        user: std::env::var("USER").unwrap_or_default(),
+        ssh_connection: std::env::var("SSH_CONNECTION").unwrap_or_default(),
+    };
+    write_frame(stream, &extension(EXT_PULL, &req.encode()))?;
+    let start = std::time::Instant::now();
+    let mut progress = crate::progress::Progress::new(label, size);
+    loop {
+        let frame = read_frame(stream).context("waiting for pull progress")?;
+        if let Some((done, _)) = parse_progress_frame(&frame) {
+            progress.update(done);
+            continue;
+        }
+        progress.finish();
+        return match frame.first() {
+            Some(&SSH_AGENT_SUCCESS) => Ok(PullOutcome::Done(crate::progress::TransferStats {
+                bytes: size,
+                elapsed: start.elapsed(),
+            })),
+            Some(&SSH_AGENT_EXTENSION_FAILURE) => {
+                let reason = Cursor::new(&frame[1..])
+                    .str()
+                    .unwrap_or_else(|_| "unknown error".into());
+                match reason.strip_prefix("PULL-FALLBACK: ") {
+                    Some(r) => Ok(PullOutcome::Fallback(r.to_string())),
+                    None => bail!("daemon error: {reason}"),
+                }
+            }
+            Some(&SSH_AGENT_FAILURE) => {
+                bail!("the agent behind SSH_AUTH_SOCK is not the backchannel daemon (see README)")
+            }
+            _ => bail!("unexpected reply from agent socket"),
+        };
+    }
 }
 
 fn normalize_file_url(t: &str) -> Result<String> {

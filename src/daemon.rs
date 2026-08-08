@@ -295,6 +295,9 @@ fn handle_client(
             Some((name, data)) if name == EXT_OPEN => {
                 handle_open(data, peer, &mut stream)?;
             }
+            Some((name, data)) if name == EXT_PULL => {
+                handle_pull(data, peer, &mut stream)?;
+            }
             Some((name, data)) if name == EXT_OPENFILE => {
                 let reply = match handle_open_file(data) {
                     Ok(summary) => {
@@ -612,6 +615,145 @@ fn handle_open_file(data: &[u8]) -> Result<String> {
     ))
 }
 
+/// Bulk transfer for `back open`/`back copy`: fetch the file ourselves over
+/// a fresh ssh connection (scp: real session-channel windows, link-speed)
+/// instead of squeezing it through the agent channel's 64KB window.
+/// Interim progress frames stream back to the client while scp runs.
+/// Failures the client can work around are prefixed PULL-FALLBACK so it
+/// retries inline instead of giving up.
+fn handle_pull(
+    data: &[u8],
+    peer: Option<peer::PeerInfo>,
+    stream: &mut UnixStream,
+) -> Result<()> {
+    use std::sync::atomic::AtomicU64;
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let fail = |stream: &mut UnixStream, msg: String| -> Result<()> {
+        logging::error(format!("pull failed: {msg}"));
+        write_frame(stream, &extension_failure(&msg))?;
+        Ok(())
+    };
+
+    let req = match PullRequest::decode(data).context("decoding pull request") {
+        Ok(r) => r,
+        Err(e) => return fail(stream, format!("{e:#}")),
+    };
+    let (alias, how) = resolve_alias(peer, &req.hostname, &req.user, &req.ssh_connection);
+
+    // Destination name: sanitized (and denylisted) for "open", since it gets
+    // handed to the default app; anonymous for "copy", which never opens it.
+    let dest_name = match req.disposition.as_str() {
+        "open" => match safe_basename(&req.path) {
+            Ok(n) => n,
+            Err(e) => return fail(stream, format!("{e:#}")),
+        },
+        "copy" => "payload".to_string(),
+        other => return fail(stream, format!("bad disposition {other:?}")),
+    };
+    let dir = std::env::temp_dir().join("backchannel-open").join(format!(
+        "{}-p{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return fail(stream, format!("creating {}: {e}", dir.display()));
+    }
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    let dest = dir.join(&dest_name);
+
+    let scp = std::env::var_os("BACKCHANNEL_SCP")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("scp"));
+    let child = Command::new(&scp)
+        .arg("-q")
+        .arg("-o")
+        .arg("BatchMode=yes")
+        .arg(format!("{alias}:{}", req.path))
+        .arg(&dest)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => return fail(stream, format!("PULL-FALLBACK: spawning {}: {e}", scp.display())),
+    };
+    logging::info(format!(
+        "pull {} from {}:{} (alias via {how}, {} bytes) -> {}",
+        req.disposition,
+        alias,
+        req.path,
+        req.size,
+        dest.display()
+    ));
+
+    // Progress: scp writes the destination in place, so its size is an
+    // honest live byte count. A frame every poll doubles as a keepalive.
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                return fail(stream, format!("waiting on scp: {e}"));
+            }
+        }
+        let done = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+        write_frame(stream, &progress_frame(done, req.size))?;
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    if !status.success() {
+        let mut stderr = String::new();
+        if let Some(mut e) = child.stderr.take() {
+            use std::io::Read;
+            let _ = e.read_to_string(&mut stderr);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        return fail(
+            stream,
+            format!("PULL-FALLBACK: scp exited with {status}: {}", stderr.trim()),
+        );
+    }
+
+    let result: Result<String> = match req.disposition.as_str() {
+        "open" => launch::open_with_default(&dest.to_string_lossy()).map(|()| {
+            format!(
+                "pulled + opened {} ({} bytes) from host '{}'",
+                dest_name, req.size, req.hostname
+            )
+        }),
+        _ => {
+            // copy: read, sniff, clipboard, clean up.
+            let outcome = std::fs::read(&dest)
+                .map_err(anyhow::Error::from)
+                .and_then(|data| {
+                    if data.len() > crate::clipboard::MAX_COPY_BYTES {
+                        bail!("pulled file exceeds the clipboard size limit");
+                    }
+                    let kind = crate::clipboard::detect_kind(&data).context(
+                        "content is neither UTF-8 text nor a recognized image",
+                    )?;
+                    crate::clipboard::set(kind, &data)?;
+                    Ok(format!(
+                        "pulled + copied {kind} ({} bytes) from host '{}'",
+                        data.len(),
+                        req.hostname
+                    ))
+                });
+            let _ = std::fs::remove_dir_all(&dir);
+            outcome
+        }
+    };
+    match result {
+        Ok(summary) => {
+            logging::info(summary);
+            Ok(write_frame(stream, &success_frame())?)
+        }
+        Err(e) => fail(stream, format!("{e:#}")),
+    }
+}
+
 fn handle_copy(data: &[u8]) -> Result<String> {
     let req = CopyRequest::decode(data).context("decoding copy request")?;
     if req.data.len() > crate::clipboard::MAX_COPY_BYTES {
@@ -657,7 +799,7 @@ fn handle_open(
             return fail(stream, &anyhow::anyhow!("refusing non-http(s) URL {url:?}"));
         }
         if *proxy {
-            let (alias, how) = resolve_alias(peer, &req);
+            let (alias, how) = resolve_alias(peer, &req.hostname, &req.user, &req.ssh_connection);
             return match proxy_open(url, &alias) {
                 Ok((final_url, target)) => {
                     logging::info(format!(
@@ -676,7 +818,7 @@ fn handle_open(
         };
     }
 
-    let (alias, how) = resolve_alias(peer, &req);
+    let (alias, how) = resolve_alias(peer, &req.hostname, &req.user, &req.ssh_connection);
     let args = launch::code_args(&alias, &req.action, req.window, req.wait);
     logging::info(format!(
         "{} from host '{}' (alias '{}' via {}) -> code {}",
@@ -736,7 +878,12 @@ fn describe(action: &Action) -> String {
 /// remote's hostname or its SSH_CONNECTION server IP), then a user@server_ip
 /// authority derived from SSH_CONNECTION — guaranteed reachable, since this
 /// very request rode over that endpoint — and only then the bare hostname.
-fn resolve_alias(peer: Option<peer::PeerInfo>, req: &OpenRequest) -> (String, &'static str) {
+fn resolve_alias(
+    peer: Option<peer::PeerInfo>,
+    hostname: &str,
+    user: &str,
+    ssh_connection: &str,
+) -> (String, &'static str) {
     match peer {
         Some(p) => match peer::process_argv(p.pid) {
             Some(argv) => match ssh_argv::destination(&argv) {
@@ -755,10 +902,10 @@ fn resolve_alias(peer: Option<peer::PeerInfo>, req: &OpenRequest) -> (String, &'
         },
         None => logging::warn("no peer credentials on this connection — falling back"),
     }
-    if let Some(alias) = alias_lookup(&req.hostname) {
+    if let Some(alias) = alias_lookup(hostname) {
         return (alias, "aliases file");
     }
-    let endpoint = parse_ssh_connection(&req.ssh_connection);
+    let endpoint = parse_ssh_connection(ssh_connection);
     if let Some((ip, _)) = &endpoint {
         if let Some(alias) = alias_lookup(ip) {
             return (alias, "aliases file (by ip)");
@@ -766,8 +913,8 @@ fn resolve_alias(peer: Option<peer::PeerInfo>, req: &OpenRequest) -> (String, &'
     }
     if let Some((ip, port)) = endpoint {
         let mut authority = String::new();
-        if !req.user.is_empty() {
-            authority.push_str(&req.user);
+        if !user.is_empty() {
+            authority.push_str(user);
             authority.push('@');
         }
         authority.push_str(&ip);
@@ -776,10 +923,7 @@ fn resolve_alias(peer: Option<peer::PeerInfo>, req: &OpenRequest) -> (String, &'
         }
         return (authority, "SSH_CONNECTION");
     }
-    (
-        req.hostname.trim_end_matches('.').to_string(),
-        "remote hostname",
-    )
+    (hostname.trim_end_matches('.').to_string(), "remote hostname")
 }
 
 /// "client_ip client_port server_ip server_port" -> (server_ip, server_port)

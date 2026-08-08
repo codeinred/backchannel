@@ -832,6 +832,116 @@ fn open_transfers_files_to_local_default_app() {
 }
 
 #[test]
+fn pull_transfers_via_scp_and_falls_back_inline() {
+    let mut env = TestEnv::new("pull");
+    env.write_stub("");
+    let opener = env.dir.join("opener.sh");
+    std::fs::write(
+        &opener,
+        "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/opener.log\"\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // scp stand-in: strips "alias:" from the source and copies locally,
+    // slowly enough (two chunks) that a progress frame can flow.
+    let scp = env.dir.join("scp-stub.sh");
+    std::fs::write(
+        &scp,
+        r#"#!/bin/sh
+echo "$@" >> "$(dirname "$0")/scp.log"
+for a in "$@"; do
+  case "$a" in *:*) src="${a#*:}";; esac
+  dest="$a"
+done
+head -c 100000 "$src" > "$dest"
+sleep 0.3
+cat "$src" > "$dest"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&scp, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let opener_str = opener.to_string_lossy().into_owned();
+    let scp_str = scp.to_string_lossy().into_owned();
+    env.start_daemon(&[
+        ("BACKCHANNEL_OPENER", opener_str.as_str()),
+        ("BACKCHANNEL_SCP", scp_str.as_str()),
+    ]);
+
+    let payload: Vec<u8> = (0..500_000u32).flat_map(|i| i.to_le_bytes()).collect();
+    let src = env.dir.join("big.svg");
+    std::fs::write(&src, &payload).unwrap();
+
+    // Threshold 1: everything pulls.
+    let out = env
+        .client_cmd("open", &[&src.to_string_lossy()])
+        .env("BACKCHANNEL_PULL_THRESHOLD", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let scp_log = std::fs::read_to_string(env.dir.join("scp.log")).unwrap();
+    assert!(scp_log.contains(&format!(":{}", src.display())), "{scp_log}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let log = std::fs::read_to_string(env.dir.join("opener.log")).unwrap_or_default();
+        if !log.trim().is_empty() {
+            let opened = log.trim().to_string();
+            assert!(opened.ends_with("/big.svg"), "{opened}");
+            assert_eq!(std::fs::read(&opened).unwrap(), payload, "pulled bytes differ");
+            break;
+        }
+        assert!(Instant::now() < deadline, "opener never invoked");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
+fn pull_fallback_when_daemon_cannot_scp() {
+    let mut env = TestEnv::new("pullfb");
+    env.write_stub("");
+    let opener = env.dir.join("opener.sh");
+    std::fs::write(
+        &opener,
+        "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/opener.log\"\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let opener_str = opener.to_string_lossy().into_owned();
+    // Daemon has a broken scp: every pull must fall back to inline.
+    env.start_daemon(&[
+        ("BACKCHANNEL_OPENER", opener_str.as_str()),
+        ("BACKCHANNEL_SCP", "/nonexistent/scp"),
+    ]);
+
+    let payload = vec![7u8; 200_000];
+    let src = env.dir.join("fb.png");
+    let png: Vec<u8> = [b"\x89PNG\r\n\x1a\n".as_slice(), &payload].concat();
+    std::fs::write(&src, &png).unwrap();
+
+    let out = env
+        .client_cmd("open", &[&src.to_string_lossy()])
+        .env("BACKCHANNEL_PULL_THRESHOLD", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("transferring inline"),
+        "{out:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let log = std::fs::read_to_string(env.dir.join("opener.log")).unwrap_or_default();
+        if !log.trim().is_empty() {
+            assert_eq!(std::fs::read(log.trim()).unwrap(), png);
+            break;
+        }
+        assert!(Instant::now() < deadline, "opener never invoked");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+#[test]
 fn openfile_sanitizes_names_and_refuses_executables() {
     let mut env = TestEnv::new("opensafe");
     env.write_stub("");

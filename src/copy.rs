@@ -10,11 +10,61 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::open::{Reply, channel_is_backchannel, hostname, in_ssh_session, read_reply};
+use crate::open::{
+    PullOutcome, Reply, channel_is_backchannel, hostname, in_ssh_session, pull_threshold,
+    read_reply, send_pull,
+};
 use crate::proto::*;
 use crate::clipboard;
 
 pub fn run(file: Option<String>) -> Result<()> {
+    // Large files with a path: have the daemon pull over a real ssh
+    // connection instead of the slow agent channel. (Stdin has no path to
+    // pull, so it always goes inline.)
+    if let Some(p) = &file {
+        if channel_is_backchannel() {
+            let abs = std::fs::canonicalize(p).with_context(|| format!("reading {p}"))?;
+            let meta = std::fs::metadata(&abs)?;
+            if meta.is_file() && meta.len() >= pull_threshold() {
+                if meta.len() as usize > clipboard::MAX_COPY_BYTES {
+                    bail!(
+                        "{} bytes exceeds the {} MiB copy limit",
+                        meta.len(),
+                        clipboard::MAX_COPY_BYTES / (1024 * 1024)
+                    );
+                }
+                let sock = std::env::var("SSH_AUTH_SOCK").context("SSH_AUTH_SOCK is not set")?;
+                let mut stream = UnixStream::connect(Path::new(&sock))
+                    .with_context(|| format!("connecting to {sock}"))?;
+                stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+                stream.set_write_timeout(Some(Duration::from_secs(60)))?;
+                match send_pull(
+                    &mut stream,
+                    "copy",
+                    &abs.to_string_lossy(),
+                    meta.len(),
+                    "clipboard",
+                )? {
+                    PullOutcome::Done(stats) => {
+                        match stats.summary() {
+                            Some(summary) => eprintln!(
+                                "copied to the clipboard on your local machine ({summary})"
+                            ),
+                            None => eprintln!(
+                                "copied {} bytes to the clipboard on your local machine",
+                                meta.len()
+                            ),
+                        }
+                        return Ok(());
+                    }
+                    PullOutcome::Fallback(reason) => {
+                        eprintln!("note: fast pull unavailable ({reason}); transferring inline");
+                    }
+                }
+            }
+        }
+    }
+
     let data = match &file {
         Some(p) => std::fs::read(p).with_context(|| format!("reading {p}"))?,
         None => {
