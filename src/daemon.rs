@@ -326,7 +326,7 @@ fn handle_open(
 
     if !req.wait {
         return match launch::run_code(args) {
-            Ok(()) => Ok(write_frame(stream, &success_frame())?),
+            Ok(()) => Ok(write_frame(stream, &success_with_authority(&alias, how))?),
             Err(e) => fail(stream, &e),
         };
     }
@@ -338,7 +338,7 @@ fn handle_open(
         Ok(w) => w,
         Err(e) => return fail(stream, &e),
     };
-    write_frame(stream, &success_frame())?;
+    write_frame(stream, &success_with_authority(&alias, how))?;
     match launch::wait_until_closed(waiting, stream) {
         Ok(()) => {
             logging::info(format!("{} closed; releasing waiter", describe(&req.action)));
@@ -372,12 +372,23 @@ fn describe(action: &Action) -> String {
 /// authority derived from SSH_CONNECTION — guaranteed reachable, since this
 /// very request rode over that endpoint — and only then the bare hostname.
 fn resolve_alias(peer: Option<peer::PeerInfo>, req: &OpenRequest) -> (String, &'static str) {
-    if let Some(p) = peer {
-        if let Some(argv) = peer::process_argv(p.pid) {
-            if let Some(dest) = ssh_argv::destination(&argv) {
-                return (dest, "ssh argv");
-            }
-        }
+    match peer {
+        Some(p) => match peer::process_argv(p.pid) {
+            Some(argv) => match ssh_argv::destination(&argv) {
+                Some(dest) => return (dest, "ssh argv"),
+                // The argv is the evidence for diagnosing this (mux-rewritten
+                // titles, ssh flags we don't know) — log it, don't drop it.
+                None => logging::warn(format!(
+                    "no ssh destination recoverable from peer argv (pid {}): {:?} — falling back",
+                    p.pid, argv
+                )),
+            },
+            None => logging::warn(format!(
+                "could not read argv of peer process (pid {}) — falling back",
+                p.pid
+            )),
+        },
+        None => logging::warn("no peer credentials on this connection — falling back"),
     }
     if let Some(alias) = alias_lookup(&req.hostname) {
         return (alias, "aliases file");

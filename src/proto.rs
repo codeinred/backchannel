@@ -110,6 +110,16 @@ pub fn success_frame() -> Vec<u8> {
     vec![SSH_AGENT_SUCCESS]
 }
 
+/// Success carrying the resolved authority and its source, so the remote
+/// can show which host the window actually targets. Clients that only look
+/// at the first byte (or pre-0.4.1 remotes) ignore the payload.
+pub fn success_with_authority(alias: &str, how: &str) -> Vec<u8> {
+    let mut m = vec![SSH_AGENT_SUCCESS];
+    put_str(&mut m, alias);
+    put_str(&mut m, how);
+    m
+}
+
 pub fn failure_frame() -> Vec<u8> {
     vec![SSH_AGENT_FAILURE]
 }

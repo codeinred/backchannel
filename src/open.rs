@@ -221,18 +221,24 @@ fn send_plan(opts: OpenOptions) -> Result<()> {
         };
         write_frame(&mut stream, &extension(EXT_OPEN, &req.encode()))?;
         match read_reply(&mut stream)? {
-            Reply::Success if opts.wait => {
+            Reply::Success(authority) if opts.wait => {
                 // Ack received: the editor is open and the daemon is holding
                 // our reply until it closes. Status goes to stderr so tools
                 // capturing stdout (EDITOR consumers) see nothing extra.
-                eprintln!("{msg} in VS Code on your local machine; waiting until closed...");
+                eprintln!(
+                    "{msg} in VS Code on your local machine{}; waiting until closed...",
+                    describe_authority(&authority)
+                );
                 match read_reply(&mut stream).context("waiting for the editor to close")? {
-                    Reply::Success => eprintln!("editor closed"),
+                    Reply::Success(_) => eprintln!("editor closed"),
                     Reply::ExtensionFailure(reason) => bail!("{reason}"),
                     Reply::Failure => bail!("unexpected agent failure while waiting"),
                 }
             }
-            Reply::Success => println!("{msg} in VS Code on your local machine"),
+            Reply::Success(authority) => println!(
+                "{msg} in VS Code on your local machine{}",
+                describe_authority(&authority)
+            ),
             Reply::ExtensionFailure(reason) => bail!("daemon error: {reason}"),
             Reply::Failure => bail!(
                 "the agent behind SSH_AUTH_SOCK is not the vs-connect daemon — this looks like \
@@ -245,15 +251,34 @@ fn send_plan(opts: OpenOptions) -> Result<()> {
 }
 
 enum Reply {
-    Success,
+    /// Success, with the resolved authority and its source when the daemon
+    /// sent them (0.4.1+).
+    Success(Option<(String, String)>),
     ExtensionFailure(String),
     Failure,
+}
+
+/// " (test-host)" normally; when the daemon had to fall back from argv parsing,
+/// name the source so a wrong authority is diagnosable from the prompt.
+fn describe_authority(authority: &Option<(String, String)>) -> String {
+    match authority {
+        Some((alias, how)) if how == "ssh argv" => format!(" ({alias})"),
+        Some((alias, how)) => format!(" ({alias} — resolved via {how})"),
+        None => String::new(),
+    }
 }
 
 fn read_reply(stream: &mut UnixStream) -> Result<Reply> {
     let reply = read_frame(stream).context("waiting for daemon reply")?;
     match reply.first() {
-        Some(&SSH_AGENT_SUCCESS) => Ok(Reply::Success),
+        Some(&SSH_AGENT_SUCCESS) => {
+            let mut c = Cursor::new(&reply[1..]);
+            let authority = match (c.str(), c.str()) {
+                (Ok(alias), Ok(how)) => Some((alias, how)),
+                _ => None, // plain [6] from an older daemon or a wait-final
+            };
+            Ok(Reply::Success(authority))
+        }
         Some(&SSH_AGENT_EXTENSION_FAILURE) => Ok(Reply::ExtensionFailure(
             Cursor::new(&reply[1..])
                 .str()

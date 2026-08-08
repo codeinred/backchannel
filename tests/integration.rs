@@ -322,9 +322,13 @@ fn frame_pipelined_during_wait_survives() {
     let open = encode_open_file(&stub, true, "testhost", "tester", "");
     send_frame(&mut s, &ext_msg("open@vs-connect", &open));
 
-    // Ack arrives once the CLI is spawned...
+    // Ack arrives once the CLI is spawned, carrying the resolved authority
+    // (hostname fallback here: the peer is this test binary, not ssh).
     let ack = read_frame(&mut s).unwrap();
-    assert_eq!(ack, [SSH_AGENT_SUCCESS], "expected spawn ack");
+    assert_eq!(ack.first(), Some(&SSH_AGENT_SUCCESS), "expected spawn ack");
+    let mut pos = 1;
+    assert_eq!(get_str(&ack, &mut pos), "testhost");
+    assert_eq!(get_str(&ack, &mut pos), "remote hostname");
 
     // ...now pipeline a ping while the wait is in flight. MSG_PEEK-based
     // watching must leave it queued, not corrupt the framing.
@@ -398,7 +402,11 @@ fn ssh_connection_provides_fallback_authority() {
         "198.51.100.15 49263 203.0.113.26 22",
     );
     send_frame(&mut s, &ext_msg("open@vs-connect", &open));
-    assert_eq!(read_frame(&mut s).unwrap(), [SSH_AGENT_SUCCESS]);
+    let reply = read_frame(&mut s).unwrap();
+    assert_eq!(reply.first(), Some(&SSH_AGENT_SUCCESS));
+    let mut pos = 1;
+    assert_eq!(get_str(&reply, &mut pos), "tester@203.0.113.26");
+    assert_eq!(get_str(&reply, &mut pos), "SSH_CONNECTION");
 
     let log = env.await_stub_log("--remote");
     assert!(
