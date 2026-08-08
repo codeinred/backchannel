@@ -2,7 +2,7 @@
 name = "backchannel"
 version = "0.11.1"
 edition = "2024"
-description = "Open VS Code windows on your local machine from remote ssh sessions, tunneled over agent forwarding"
+description = "Open projects and files on the host machine from within an ssh session, tunneled over agent forwarding"
 license = "MIT"
 
 # The crate keeps the good name; the binary is short for fingers (rg/fd style).
