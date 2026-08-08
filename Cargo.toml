@@ -4,6 +4,7 @@ version = "0.11.1"
 edition = "2024"
 description = "Open projects and files on the host machine from within an ssh session, tunneled over agent forwarding"
 license = "MIT"
+rust-version = "1.88"  # let-chains (edition 2024 alone would only need 1.85)
 repository = "https://github.com/codeinred/backchannel"
 readme = "README.md"
 keywords = ["ssh", "remote", "clipboard", "vscode", "agent-forwarding"]
