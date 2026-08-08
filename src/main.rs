@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
-    name = "vs-connect",
+    name = "backchannel",
     version,
     about = "Open VS Code windows on your local machine from remote ssh sessions"
 )]
@@ -55,7 +55,7 @@ enum Command {
         #[arg(required_unless_present = "diff")]
         paths: Vec<String>,
     },
-    /// Report what vs-connect can see from here (daemon, sockets, forwarding)
+    /// Report what backchannel can see from here (daemon, sockets, forwarding)
     Status,
 }
 

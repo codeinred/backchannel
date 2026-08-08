@@ -123,7 +123,7 @@ mod tests {
 
     #[test]
     fn non_ssh_process_is_inconclusive() {
-        assert!(destination(&argv(&["vs-connect", "open", "."])).is_none());
+        assert!(destination(&argv(&["backchannel", "open", "."])).is_none());
     }
 
     #[test]

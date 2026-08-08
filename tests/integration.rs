@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const BIN: &str = env!("CARGO_BIN_EXE_vs-connect");
+const BIN: &str = env!("CARGO_BIN_EXE_backchannel");
 
 // ---- wire format helpers (independent reimplementation) ----
 
@@ -53,24 +53,24 @@ fn get_str(buf: &[u8], pos: &mut usize) -> String {
     s
 }
 
-/// Ping the daemon; Some(pid) if a vs-connect daemon answers.
+/// Ping the daemon; Some(pid) if a backchannel daemon answers.
 fn ping(sock: &Path) -> Option<u32> {
     let mut s = UnixStream::connect(sock).ok()?;
     s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-    send_frame(&mut s, &ext_msg("ping@vs-connect", &[]));
+    send_frame(&mut s, &ext_msg("ping@backchannel", &[]));
     let reply = read_frame(&mut s).ok()?;
     if reply.first() != Some(&SSH_AGENT_SUCCESS) {
         return None;
     }
     let mut pos = 1;
-    if get_str(&reply, &mut pos) != "vs-connect" {
+    if get_str(&reply, &mut pos) != "backchannel" {
         return None;
     }
     let _version = get_str(&reply, &mut pos);
     Some(u32::from_be_bytes(reply[pos..pos + 4].try_into().unwrap()))
 }
 
-/// Encode an open@vs-connect v4 request for a single file.
+/// Encode an open@backchannel v4 request for a single file.
 fn encode_open_file(path: &str, wait: bool, hostname: &str, user: &str, ssh_conn: &str) -> Vec<u8> {
     let mut b = Vec::new();
     put_u32(&mut b, 4);
@@ -97,7 +97,7 @@ struct TestEnv {
 impl TestEnv {
     fn new(name: &str) -> TestEnv {
         // Base must be short: unix socket paths have a ~104-byte limit.
-        let dir = std::env::temp_dir().join(format!("vsct-{name}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("bct-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("agent.sock");
@@ -128,8 +128,8 @@ impl TestEnv {
     fn start_daemon(&mut self, extra_env: &[(&str, &str)]) {
         let mut cmd = Command::new(BIN);
         cmd.args(["daemon", "--foreground"])
-            .env("VS_CONNECT_DIR", &self.dir)
-            .env("VS_CONNECT_CODE", self.dir.join("code-stub.sh"))
+            .env("BACKCHANNEL_DIR", &self.dir)
+            .env("BACKCHANNEL_CODE", self.dir.join("code-stub.sh"))
             .env_remove("SSH_AUTH_SOCK")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -145,7 +145,7 @@ impl TestEnv {
         }
     }
 
-    /// Run `vs-connect open` against this daemon, as a remote shim would.
+    /// Run `backchannel open` against this daemon, as a remote shim would.
     fn open_cmd(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(BIN);
         cmd.arg("open")
@@ -320,7 +320,7 @@ fn frame_pipelined_during_wait_survives() {
     s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
 
     let open = encode_open_file(&stub, true, "testhost", "tester", "");
-    send_frame(&mut s, &ext_msg("open@vs-connect", &open));
+    send_frame(&mut s, &ext_msg("open@backchannel", &open));
 
     // Ack arrives once the CLI is spawned, carrying the resolved authority
     // (hostname fallback here: the peer is this test binary, not ssh).
@@ -332,7 +332,7 @@ fn frame_pipelined_during_wait_survives() {
 
     // ...now pipeline a ping while the wait is in flight. MSG_PEEK-based
     // watching must leave it queued, not corrupt the framing.
-    send_frame(&mut s, &ext_msg("ping@vs-connect", &[]));
+    send_frame(&mut s, &ext_msg("ping@backchannel", &[]));
 
     let start = Instant::now();
     let final_reply = read_frame(&mut s).unwrap();
@@ -345,7 +345,7 @@ fn frame_pipelined_during_wait_survives() {
     let ping_reply = read_frame(&mut s).unwrap();
     let mut pos = 1;
     assert_eq!(ping_reply.first(), Some(&SSH_AGENT_SUCCESS));
-    assert_eq!(get_str(&ping_reply, &mut pos), "vs-connect");
+    assert_eq!(get_str(&ping_reply, &mut pos), "backchannel");
 }
 
 #[test]
@@ -377,11 +377,11 @@ fn proxies_agent_traffic_verbatim() {
     send_frame(&mut s, &[11]);
     assert_eq!(read_frame(&mut s).unwrap(), [12, 0, 0, 0, 0]);
 
-    // And vs-connect extensions are still intercepted, not proxied.
-    send_frame(&mut s, &ext_msg("ping@vs-connect", &[]));
+    // And backchannel extensions are still intercepted, not proxied.
+    send_frame(&mut s, &ext_msg("ping@backchannel", &[]));
     let reply = read_frame(&mut s).unwrap();
     let mut pos = 1;
-    assert_eq!(get_str(&reply, &mut pos), "vs-connect");
+    assert_eq!(get_str(&reply, &mut pos), "backchannel");
 }
 
 #[test]
@@ -401,7 +401,7 @@ fn ssh_connection_provides_fallback_authority() {
         "tester",
         "198.51.100.15 49263 203.0.113.26 22",
     );
-    send_frame(&mut s, &ext_msg("open@vs-connect", &open));
+    send_frame(&mut s, &ext_msg("open@backchannel", &open));
     let reply = read_frame(&mut s).unwrap();
     assert_eq!(reply.first(), Some(&SSH_AGENT_SUCCESS));
     let mut pos = 1;
@@ -425,7 +425,7 @@ fn replace_takes_over_and_shutdown_works() {
     // --replace daemonizes; poll until the pid changes.
     let status = Command::new(BIN)
         .args(["daemon", "--replace"])
-        .env("VS_CONNECT_DIR", &env.dir)
+        .env("BACKCHANNEL_DIR", &env.dir)
         .env_remove("SSH_AUTH_SOCK")
         .status()
         .unwrap();
@@ -446,7 +446,7 @@ fn replace_takes_over_and_shutdown_works() {
     // removes its socket.
     let mut s = UnixStream::connect(env.sock()).unwrap();
     s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-    send_frame(&mut s, &ext_msg("shutdown@vs-connect", &[]));
+    send_frame(&mut s, &ext_msg("shutdown@backchannel", &[]));
     let _ = read_frame(&mut s);
     let deadline = Instant::now() + Duration::from_secs(5);
     while env.sock().exists() {

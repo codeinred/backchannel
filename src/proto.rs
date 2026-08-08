@@ -11,9 +11,9 @@ pub const SSH_AGENT_SUCCESS: u8 = 6;
 pub const SSH_AGENTC_EXTENSION: u8 = 27;
 pub const SSH_AGENT_EXTENSION_FAILURE: u8 = 28;
 
-pub const EXT_PING: &str = "ping@vs-connect";
-pub const EXT_OPEN: &str = "open@vs-connect";
-pub const EXT_SHUTDOWN: &str = "shutdown@vs-connect";
+pub const EXT_PING: &str = "ping@backchannel";
+pub const EXT_OPEN: &str = "open@backchannel";
+pub const EXT_SHUTDOWN: &str = "shutdown@backchannel";
 
 /// Far above any legitimate agent message; bounds memory against a
 /// misbehaving peer.
@@ -300,7 +300,7 @@ impl OpenRequest {
                     ssh_connection,
                 })
             }
-            v => Err(bad(format!("unsupported open@vs-connect version {v}"))),
+            v => Err(bad(format!("unsupported open@backchannel version {v}"))),
         }
     }
 }
@@ -315,21 +315,21 @@ pub struct PingReply {
 impl PingReply {
     pub fn encode(&self) -> Vec<u8> {
         let mut b = vec![SSH_AGENT_SUCCESS];
-        put_str(&mut b, "vs-connect");
+        put_str(&mut b, "backchannel");
         put_str(&mut b, &self.version);
         put_u32(&mut b, self.pid);
         put_str(&mut b, &self.upstream);
         b
     }
 
-    /// None when the frame isn't from a vs-connect daemon (e.g. a real
+    /// None when the frame isn't from a backchannel daemon (e.g. a real
     /// ssh-agent answering SSH_AGENT_FAILURE to the unknown extension).
     pub fn decode(frame: &[u8]) -> Option<PingReply> {
         if frame.first() != Some(&SSH_AGENT_SUCCESS) {
             return None;
         }
         let mut c = Cursor::new(&frame[1..]);
-        if c.str().ok()? != "vs-connect" {
+        if c.str().ok()? != "backchannel" {
             return None;
         }
         Some(PingReply {

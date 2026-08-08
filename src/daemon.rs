@@ -1,7 +1,7 @@
 //! The local daemon. ssh forwards our socket to remotes as "the agent", so
 //! every connection here is either real agent traffic (relayed verbatim to
-//! the actual ssh-agent) or a vs-connect extension message (ping / open /
-//! shutdown) from the remote wrapper or another vs-connect process.
+//! the actual ssh-agent) or a backchannel extension message (ping / open /
+//! shutdown) from the remote wrapper or another backchannel process.
 
 use std::ffi::CString;
 use std::io;
@@ -37,7 +37,7 @@ pub fn run(replace: bool, foreground: bool) -> Result<()> {
     match probe_existing(&sock_path) {
         // Quiet: shell rcs run this on every new terminal, so the expected
         // outcomes (started / already running) print nothing; only errors
-        // reach stderr. `vs-connect status` is the interactive view.
+        // reach stderr. `backchannel status` is the interactive view.
         Existing::Alive(_) if !replace => return Ok(()),
         Existing::Alive(pid) => {
             logging::info(format!("replacing running daemon (pid {pid})"));
@@ -92,7 +92,7 @@ pub fn run(replace: bool, foreground: bool) -> Result<()> {
     Ok(())
 }
 
-/// Ping whatever is listening on `path`. Ok(Some) = a vs-connect daemon,
+/// Ping whatever is listening on `path`. Ok(Some) = a backchannel daemon,
 /// Ok(None) = something answered but it isn't us (a real agent), Err = no
 /// listener / no answer. Shared with `status`.
 pub fn ping(path: &Path) -> io::Result<Option<PingReply>> {
@@ -110,7 +110,7 @@ fn probe_existing(path: &Path) -> Existing {
     }
     match ping(path) {
         Ok(Some(reply)) => Existing::Alive(reply.pid),
-        // A live non-vs-connect agent on our socket path would be bizarre;
+        // A live non-backchannel agent on our socket path would be bizarre;
         // treat like stale — we own this path.
         _ => Existing::Stale,
     }
@@ -145,7 +145,7 @@ fn resolve_upstream(our_sock: &Path) -> Option<PathBuf> {
         };
     if same_path {
         logging::warn(
-            "SSH_AUTH_SOCK points at vs-connect's own socket; agent passthrough disabled to avoid a proxy loop",
+            "SSH_AUTH_SOCK points at backchannel's own socket; agent passthrough disabled to avoid a proxy loop",
         );
         return None;
     }

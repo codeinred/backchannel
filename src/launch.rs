@@ -87,7 +87,7 @@ fn which(name: &str) -> Option<PathBuf> {
 }
 
 pub fn find_code() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("VS_CONNECT_CODE") {
+    if let Some(p) = std::env::var_os("BACKCHANNEL_CODE") {
         return Some(PathBuf::from(p));
     }
     if let Some(p) = which("code") {
@@ -111,7 +111,7 @@ pub fn find_code() -> Option<PathBuf> {
 
 pub fn run_code(args: Vec<String>) -> Result<()> {
     let code = find_code().context(
-        "could not find the `code` CLI — install VS Code's shell command or set VS_CONNECT_CODE",
+        "could not find the `code` CLI — install VS Code's shell command or set BACKCHANNEL_CODE",
     )?;
     let child = Command::new(&code)
         .args(&args)
@@ -145,7 +145,7 @@ pub struct WaitingCode {
 
 pub fn spawn_code_waiting(args: &[String]) -> Result<WaitingCode> {
     let code = find_code().context(
-        "could not find the `code` CLI — install VS Code's shell command or set VS_CONNECT_CODE",
+        "could not find the `code` CLI — install VS Code's shell command or set BACKCHANNEL_CODE",
     )?;
     let mut child = Command::new(&code)
         .args(args)

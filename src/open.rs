@@ -1,5 +1,5 @@
 //! The remote side: send open requests down $SSH_AUTH_SOCK, which ssh has
-//! forwarded back to the vs-connect daemon on the local machine.
+//! forwarded back to the backchannel daemon on the local machine.
 
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -55,22 +55,22 @@ fn to_cli_args(opts: &OpenOptions) -> Vec<String> {
 }
 
 /// Invoked via a symlink named `code`. Precedence: VS Code's own remote CLI
-/// (its terminals), then a live vs-connect channel (remote ssh sessions),
+/// (its terminals), then a live backchannel (remote ssh sessions),
 /// then the machine's real VS Code — so on a desktop that also gets remoted
 /// into, `code` keeps behaving exactly like the real thing in person.
 pub fn run_as_code_shim(args: Vec<String>) -> Result<()> {
     if let Some(cli) = vscode_terminal_cli() {
         return exec_real_cli(&cli, &args);
     }
-    if channel_is_vs_connect() {
+    if channel_is_backchannel() {
         return send_plan(parse_shim_args(args)?);
     }
     if in_ssh_session() {
         // A broken channel in an ssh session: launching a local (likely
         // headless) VS Code here would be far more confusing than an error.
         bail!(
-            "no vs-connect channel in this ssh session — is the daemon running on your local \
-             machine, and was this session opened after it started? `vs-connect status` has \
+            "no backchannel in this ssh session — is the daemon running on your local \
+             machine, and was this session opened after it started? `backchannel status` has \
              details."
         );
     }
@@ -80,8 +80,8 @@ pub fn run_as_code_shim(args: Vec<String>) -> Result<()> {
     }
 }
 
-/// True when $SSH_AUTH_SOCK answers as a vs-connect daemon.
-fn channel_is_vs_connect() -> bool {
+/// True when $SSH_AUTH_SOCK answers as a backchannel daemon.
+fn channel_is_backchannel() -> bool {
     let Some(sock) = std::env::var_os("SSH_AUTH_SOCK").filter(|s| !s.is_empty()) else {
         return false;
     };
@@ -94,16 +94,16 @@ fn in_ssh_session() -> bool {
         .any(|v| std::env::var_os(v).is_some_and(|s| !s.is_empty()))
 }
 
-/// The machine's real `code`, skipping ourselves and any other vs-connect
+/// The machine's real `code`, skipping ourselves and any other backchannel
 /// symlink so the shim can never recurse into itself.
 fn find_local_code() -> Option<PathBuf> {
     let self_exe = std::env::current_exe()
         .ok()
         .and_then(|p| p.canonicalize().ok());
-    let is_vs_connect = |p: &Path| match p.canonicalize() {
+    let is_backchannel_shim = |p: &Path| match p.canonicalize() {
         Ok(c) => {
             Some(&c) == self_exe.as_ref()
-                || c.file_name().is_some_and(|n| n == "vs-connect")
+                || c.file_name().is_some_and(|n| n == "backchannel")
         }
         Err(_) => true, // unresolvable → not launchable anyway
     };
@@ -111,7 +111,7 @@ fn find_local_code() -> Option<PathBuf> {
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
             let candidate = dir.join("code");
-            if candidate.is_file() && !is_vs_connect(&candidate) {
+            if candidate.is_file() && !is_backchannel_shim(&candidate) {
                 return Some(candidate);
             }
         }
@@ -146,7 +146,7 @@ fn parse_shim_args(args: Vec<String>) -> Result<OpenOptions> {
             "-d" | "--diff" => diff_flag = true,
             "-w" | "--wait" => opts.wait = true,
             s if s.starts_with('-') => bail!(
-                "unsupported flag {s} over vs-connect (supported: -n/--new-window, \
+                "unsupported flag {s} over backchannel (supported: -n/--new-window, \
                  -r/--reuse-window, -g/--goto, -d/--diff, -w/--wait)"
             ),
             _ => opts.paths.push(a),
@@ -171,15 +171,15 @@ fn send_plan(opts: OpenOptions) -> Result<()> {
         // Sequential per-path requests would wait for each file before
         // opening the next — not "open all, wait for all". Refuse rather
         // than ship the wrong semantics.
-        bail!("over vs-connect, --wait supports exactly one path (or --diff)");
+        bail!("over backchannel, --wait supports exactly one path (or --diff)");
     }
     let sock = std::env::var("SSH_AUTH_SOCK").context(
-        "SSH_AUTH_SOCK is not set — vs-connect needs an ssh session with agent forwarding \
-         pointed at the vs-connect daemon (see README)",
+        "SSH_AUTH_SOCK is not set — backchannel needs an ssh session with agent forwarding \
+         pointed at the backchannel daemon (see README)",
     )?;
     let hostname = hostname();
     let mut stream = UnixStream::connect(&sock).with_context(|| {
-        format!("connecting to {sock} — is the vs-connect daemon running on your local machine?")
+        format!("connecting to {sock} — is the backchannel daemon running on your local machine?")
     })?;
     // An editor can stay open for hours: wait mode must not time out.
     let read_timeout = if opts.wait {
@@ -241,8 +241,8 @@ fn send_plan(opts: OpenOptions) -> Result<()> {
             ),
             Reply::ExtensionFailure(reason) => bail!("daemon error: {reason}"),
             Reply::Failure => bail!(
-                "the agent behind SSH_AUTH_SOCK is not the vs-connect daemon — this looks like \
-                 plain agent forwarding. Point ForwardAgent at the vs-connect socket in your \
+                "the agent behind SSH_AUTH_SOCK is not the backchannel daemon — this looks like \
+                 plain agent forwarding. Point ForwardAgent at the backchannel socket in your \
                  local ssh config (see README)."
             ),
         }

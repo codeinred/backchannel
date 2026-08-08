@@ -3,11 +3,11 @@ use std::path::PathBuf;
 /// All state lives in one directory so the whole tool can be pointed
 /// elsewhere (e.g. for tests) with a single env var.
 pub fn base_dir() -> PathBuf {
-    if let Some(d) = std::env::var_os("VS_CONNECT_DIR") {
+    if let Some(d) = std::env::var_os("BACKCHANNEL_DIR") {
         return PathBuf::from(d);
     }
     let home = std::env::var_os("HOME").expect("HOME is not set");
-    PathBuf::from(home).join(".vs-connect")
+    PathBuf::from(home).join(".backchannel")
 }
 
 pub fn socket_path() -> PathBuf {

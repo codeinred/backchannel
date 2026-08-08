@@ -1,6 +1,6 @@
 [package]
-name = "vs-connect"
-version = "0.4.1"
+name = "backchannel"
+version = "0.5.0"
 edition = "2024"
 description = "Open VS Code windows on your local machine from remote ssh sessions, tunneled over agent forwarding"
 license = "MIT"
