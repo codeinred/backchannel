@@ -187,6 +187,10 @@ pub enum Action {
 pub struct OpenRequest {
     pub action: Action,
     pub window: WindowMode,
+    /// Defer the final reply until the editor is closed (`code --wait`).
+    /// Wait replies are two-phase: an ack frame once the CLI is spawned,
+    /// then the final success/failure when it exits.
+    pub wait: bool,
     /// Hostname of the sending machine — the alias fallback when the daemon
     /// can't identify the ssh process that carried the request.
     pub hostname: String,
@@ -195,8 +199,9 @@ pub struct OpenRequest {
 impl OpenRequest {
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::new();
-        put_u32(&mut b, 2); // protocol version
+        put_u32(&mut b, 3); // protocol version
         put_str(&mut b, self.window.as_str());
+        put_u32(&mut b, self.wait as u32);
         match &self.action {
             Action::Open { kind, path, line, col } => {
                 put_str(&mut b, "open");
@@ -232,13 +237,15 @@ impl OpenRequest {
                         col: 0,
                     },
                     window: WindowMode::Default,
+                    wait: false,
                     hostname: c.str()?,
                 })
             }
-            2 => {
+            v @ (2 | 3) => {
                 let window = c.str()?;
                 let window = WindowMode::parse(&window)
                     .ok_or_else(|| bad(format!("bad window mode {window:?}")))?;
+                let wait = if v >= 3 { c.u32()? != 0 } else { false };
                 let tag = c.str()?;
                 let action = match tag.as_str() {
                     "open" => {
@@ -261,6 +268,7 @@ impl OpenRequest {
                 Ok(OpenRequest {
                     action,
                     window,
+                    wait,
                     hostname: c.str()?,
                 })
             }
@@ -347,6 +355,7 @@ mod tests {
                 col: 0,
             },
             window: WindowMode::Default,
+            wait: false,
             hostname: "test-host.example.com".into(),
         };
         assert_eq!(OpenRequest::decode(&req.encode()).unwrap(), req);
@@ -362,6 +371,7 @@ mod tests {
                 col: 5,
             },
             window: WindowMode::New,
+            wait: true,
             hostname: "h".into(),
         };
         assert_eq!(OpenRequest::decode(&req.encode()).unwrap(), req);
@@ -372,6 +382,7 @@ mod tests {
                 right: "/b".into(),
             },
             window: WindowMode::Reuse,
+            wait: false,
             hostname: "h".into(),
         };
         assert_eq!(OpenRequest::decode(&req.encode()).unwrap(), req);

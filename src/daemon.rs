@@ -244,14 +244,7 @@ fn handle_client(
                 std::process::exit(0);
             }
             Some((name, data)) if name == EXT_OPEN => {
-                let reply = match handle_open(data, peer) {
-                    Ok(()) => success_frame(),
-                    Err(e) => {
-                        logging::error(format!("open failed: {e:#}"));
-                        extension_failure(&format!("{e:#}"))
-                    }
-                };
-                write_frame(&mut stream, &reply)?;
+                handle_open(data, peer, &mut stream)?;
             }
             // Anything else — identities, signing, session-bind@openssh.com,
             // unknown extensions — is real agent traffic. Relay verbatim.
@@ -302,10 +295,26 @@ fn proxy_roundtrip(
     unreachable!()
 }
 
-fn handle_open(data: &[u8], peer: Option<peer::PeerInfo>) -> Result<()> {
-    let req = OpenRequest::decode(data).context("decoding open request")?;
+/// Decode and act on an open request, writing the reply frame(s) to the
+/// client. Returns Err only for socket-level failures; request-level
+/// problems become extension_failure replies.
+fn handle_open(
+    data: &[u8],
+    peer: Option<peer::PeerInfo>,
+    stream: &mut UnixStream,
+) -> Result<()> {
+    let fail = |stream: &mut UnixStream, e: &anyhow::Error| -> Result<()> {
+        logging::error(format!("open failed: {e:#}"));
+        write_frame(stream, &extension_failure(&format!("{e:#}")))?;
+        Ok(())
+    };
+
+    let req = match OpenRequest::decode(data).context("decoding open request") {
+        Ok(r) => r,
+        Err(e) => return fail(stream, &e),
+    };
     let (alias, how) = resolve_alias(peer, &req.hostname);
-    let args = launch::code_args(&alias, &req.action, req.window);
+    let args = launch::code_args(&alias, &req.action, req.window, req.wait);
     logging::info(format!(
         "{} from host '{}' (alias '{}' via {}) -> code {}",
         describe(&req.action),
@@ -314,7 +323,34 @@ fn handle_open(data: &[u8], peer: Option<peer::PeerInfo>) -> Result<()> {
         how,
         args.join(" ")
     ));
-    launch::run_code(args)
+
+    if !req.wait {
+        return match launch::run_code(args) {
+            Ok(()) => Ok(write_frame(stream, &success_frame())?),
+            Err(e) => fail(stream, &e),
+        };
+    }
+
+    // Wait mode: ack once the CLI is spawned, then hold the reply until the
+    // editor closes. The blocked client (and the git/EDITOR flow behind it)
+    // unblocks when the final frame lands.
+    let waiting = match launch::spawn_code_waiting(&args) {
+        Ok(w) => w,
+        Err(e) => return fail(stream, &e),
+    };
+    write_frame(stream, &success_frame())?;
+    match launch::wait_until_closed(waiting, stream) {
+        Ok(()) => {
+            logging::info(format!("{} closed; releasing waiter", describe(&req.action)));
+            Ok(write_frame(stream, &success_frame())?)
+        }
+        Err(e) => {
+            logging::warn(format!("--wait ended without a clean close: {e:#}"));
+            // The client may already be gone; a failed write here is fine.
+            let _ = write_frame(stream, &extension_failure(&format!("{e:#}")));
+            Ok(())
+        }
+    }
 }
 
 fn describe(action: &Action) -> String {

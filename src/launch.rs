@@ -1,9 +1,12 @@
 //! Build vscode-remote:// URIs and hand them to the local VS Code CLI.
 
+use std::io::{self, Read};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
 use crate::logging;
@@ -30,9 +33,17 @@ pub fn remote_uri(alias: &str, path: &str) -> String {
 /// files ride --remote + --goto so positions work; diffs ride --remote +
 /// --diff. Plain paths (not URIs) are fine with --remote because the shim
 /// always sends absolute paths.
-pub fn code_args(alias: &str, action: &crate::proto::Action, window: WindowMode) -> Vec<String> {
+pub fn code_args(
+    alias: &str,
+    action: &crate::proto::Action,
+    window: WindowMode,
+    wait: bool,
+) -> Vec<String> {
     use crate::proto::Action;
     let mut args: Vec<String> = Vec::new();
+    if wait {
+        args.push("--wait".into());
+    }
     match window {
         WindowMode::New => args.push("--new-window".into()),
         WindowMode::Reuse => args.push("--reuse-window".into()),
@@ -125,6 +136,83 @@ pub fn run_code(args: Vec<String>) -> Result<()> {
     Ok(())
 }
 
+/// A spawned `code --wait` CLI. Its stderr is drained off-thread — the pipe
+/// must be consumed or a chatty child could block on it mid-wait.
+pub struct WaitingCode {
+    child: Child,
+    stderr_rx: std::sync::mpsc::Receiver<String>,
+}
+
+pub fn spawn_code_waiting(args: &[String]) -> Result<WaitingCode> {
+    let code = find_code().context(
+        "could not find the `code` CLI — install VS Code's shell command or set VS_CONNECT_CODE",
+    )?;
+    let mut child = Command::new(&code)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning {}", code.display()))?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(mut stderr) = child.stderr.take() {
+        std::thread::spawn(move || {
+            let mut s = String::new();
+            let _ = stderr.read_to_string(&mut s);
+            let _ = tx.send(s);
+        });
+    }
+    Ok(WaitingCode {
+        child,
+        stderr_rx: rx,
+    })
+}
+
+/// Block until the spawned CLI exits (the editor was closed) or the client
+/// connection dies (remote Ctrl-C, dropped ssh session) — in which case the
+/// CLI is killed so it doesn't wait forever. The editor window itself stays
+/// open either way, matching native `code -w` behavior on interrupt.
+pub fn wait_until_closed(mut wc: WaitingCode, client: &UnixStream) -> Result<()> {
+    let _ = client.set_read_timeout(Some(Duration::from_millis(200)));
+    let result = loop {
+        match wc.child.try_wait() {
+            Ok(Some(status)) if status.success() => break Ok(()),
+            Ok(Some(status)) => {
+                let stderr = wc
+                    .stderr_rx
+                    .recv_timeout(Duration::from_secs(1))
+                    .unwrap_or_default();
+                break Err(anyhow!("code exited with {status}: {}", stderr.trim()));
+            }
+            Ok(None) => {}
+            Err(e) => break Err(anyhow!("waiting on code: {e}")),
+        }
+        // The client sends nothing while it waits, so any read is either a
+        // timeout (keep polling) or EOF/error (client is gone).
+        let mut probe = [0u8; 1];
+        let mut client_ref = client;
+        match client_ref.read(&mut probe) {
+            Ok(0) => {
+                let _ = wc.child.kill();
+                let _ = wc.child.wait();
+                break Err(anyhow!("remote client disconnected during --wait"));
+            }
+            Ok(_) => logging::warn("unexpected data from client during --wait; ignoring"),
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock
+                    || e.kind() == io::ErrorKind::TimedOut => {}
+            Err(e) => {
+                let _ = wc.child.kill();
+                let _ = wc.child.wait();
+                break Err(anyhow!("client connection failed during --wait: {e}"));
+            }
+        }
+    };
+    // handle_client's frame loop expects a blocking socket.
+    let _ = client.set_read_timeout(None);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,7 +240,8 @@ mod tests {
             code_args(
                 "test-host",
                 &Action::Open { kind: Kind::Folder, path: "/opt".into(), line: 0, col: 0 },
-                WindowMode::New
+                WindowMode::New,
+                false
             ),
             vec!["--new-window", "--folder-uri", "vscode-remote://ssh-remote+test-host/opt"]
         );
@@ -165,9 +254,10 @@ mod tests {
             code_args(
                 "test-host",
                 &Action::Open { kind: Kind::File, path: "/a/b.rs".into(), line: 10, col: 5 },
-                WindowMode::Default
+                WindowMode::Default,
+                true
             ),
-            vec!["--remote", "ssh-remote+test-host", "--goto", "/a/b.rs:10:5"]
+            vec!["--wait", "--remote", "ssh-remote+test-host", "--goto", "/a/b.rs:10:5"]
         );
     }
 
@@ -178,7 +268,8 @@ mod tests {
             code_args(
                 "test-host",
                 &Action::Diff { left: "/a".into(), right: "/b".into() },
-                WindowMode::Reuse
+                WindowMode::Reuse,
+                false
             ),
             vec!["--reuse-window", "--remote", "ssh-remote+test-host", "--diff", "/a", "/b"]
         );

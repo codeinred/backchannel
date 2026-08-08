@@ -48,6 +48,9 @@ enum Command {
         /// Compare two files
         #[arg(short = 'd', long, num_args = 2, value_names = ["LEFT", "RIGHT"])]
         diff: Option<Vec<String>>,
+        /// Block until the editor is closed (single path or --diff)
+        #[arg(short = 'w', long)]
+        wait: bool,
         /// Files or folders to open; positions as path:line[:col] jump there
         #[arg(required_unless_present = "diff")]
         paths: Vec<String>,
@@ -70,7 +73,7 @@ fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Daemon { replace, foreground } => daemon::run(replace, foreground),
-        Command::Open { new_window, reuse_window, goto, diff, paths } => {
+        Command::Open { new_window, reuse_window, goto, diff, wait, paths } => {
             open::run(open::OpenOptions {
                 window: if new_window {
                     proto::WindowMode::New
@@ -85,6 +88,7 @@ fn main() -> Result<()> {
                     let left = v.pop().expect("clap enforces two values");
                     (left, right)
                 }),
+                wait,
                 paths,
             })
         }

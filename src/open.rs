@@ -17,6 +17,9 @@ pub struct OpenOptions {
     /// don't exist as-is).
     pub force_goto: bool,
     pub diff: Option<(String, String)>,
+    /// Block until the editor is closed (`code --wait`); over the channel
+    /// this requires a single path or --diff.
+    pub wait: bool,
     pub paths: Vec<String>,
 }
 
@@ -38,6 +41,9 @@ fn to_cli_args(opts: &OpenOptions) -> Vec<String> {
     }
     if opts.force_goto {
         v.push("--goto".into());
+    }
+    if opts.wait {
+        v.push("--wait".into());
     }
     if let Some((l, r)) = &opts.diff {
         v.push("--diff".into());
@@ -128,6 +134,7 @@ fn parse_shim_args(args: Vec<String>) -> Result<OpenOptions> {
         window: WindowMode::Default,
         force_goto: false,
         diff: None,
+        wait: false,
         paths: Vec::new(),
     };
     let mut diff_flag = false;
@@ -137,9 +144,10 @@ fn parse_shim_args(args: Vec<String>) -> Result<OpenOptions> {
             "-r" | "--reuse-window" => opts.window = WindowMode::Reuse,
             "-g" | "--goto" => opts.force_goto = true,
             "-d" | "--diff" => diff_flag = true,
+            "-w" | "--wait" => opts.wait = true,
             s if s.starts_with('-') => bail!(
                 "unsupported flag {s} over vs-connect (supported: -n/--new-window, \
-                 -r/--reuse-window, -g/--goto, -d/--diff)"
+                 -r/--reuse-window, -g/--goto, -d/--diff, -w/--wait)"
             ),
             _ => opts.paths.push(a),
         }
@@ -159,6 +167,12 @@ fn parse_shim_args(args: Vec<String>) -> Result<OpenOptions> {
 }
 
 fn send_plan(opts: OpenOptions) -> Result<()> {
+    if opts.wait && opts.diff.is_none() && opts.paths.len() != 1 {
+        // Sequential per-path requests would wait for each file before
+        // opening the next — not "open all, wait for all". Refuse rather
+        // than ship the wrong semantics.
+        bail!("over vs-connect, --wait supports exactly one path (or --diff)");
+    }
     let sock = std::env::var("SSH_AUTH_SOCK").context(
         "SSH_AUTH_SOCK is not set — vs-connect needs an ssh session with agent forwarding \
          pointed at the vs-connect daemon (see README)",
@@ -167,7 +181,13 @@ fn send_plan(opts: OpenOptions) -> Result<()> {
     let mut stream = UnixStream::connect(&sock).with_context(|| {
         format!("connecting to {sock} — is the vs-connect daemon running on your local machine?")
     })?;
-    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    // An editor can stay open for hours: wait mode must not time out.
+    let read_timeout = if opts.wait {
+        None
+    } else {
+        Some(Duration::from_secs(10))
+    };
+    stream.set_read_timeout(read_timeout)?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
 
     let mut requests: Vec<(Action, String)> = Vec::new();
@@ -192,29 +212,52 @@ fn send_plan(opts: OpenOptions) -> Result<()> {
         let req = OpenRequest {
             action,
             window: opts.window,
+            wait: opts.wait,
             hostname: hostname.clone(),
         };
         write_frame(&mut stream, &extension(EXT_OPEN, &req.encode()))?;
-        let reply = read_frame(&mut stream).context("waiting for daemon reply")?;
-        match reply.first() {
-            Some(&SSH_AGENT_SUCCESS) => {
-                println!("{msg} in VS Code on your local machine");
+        match read_reply(&mut stream)? {
+            Reply::Success if opts.wait => {
+                // Ack received: the editor is open and the daemon is holding
+                // our reply until it closes. Status goes to stderr so tools
+                // capturing stdout (EDITOR consumers) see nothing extra.
+                eprintln!("{msg} in VS Code on your local machine; waiting until closed...");
+                match read_reply(&mut stream).context("waiting for the editor to close")? {
+                    Reply::Success => eprintln!("editor closed"),
+                    Reply::ExtensionFailure(reason) => bail!("{reason}"),
+                    Reply::Failure => bail!("unexpected agent failure while waiting"),
+                }
             }
-            Some(&SSH_AGENT_EXTENSION_FAILURE) => {
-                let reason = Cursor::new(&reply[1..])
-                    .str()
-                    .unwrap_or_else(|_| "unknown error".into());
-                bail!("daemon error: {reason}");
-            }
-            Some(&SSH_AGENT_FAILURE) => bail!(
+            Reply::Success => println!("{msg} in VS Code on your local machine"),
+            Reply::ExtensionFailure(reason) => bail!("daemon error: {reason}"),
+            Reply::Failure => bail!(
                 "the agent behind SSH_AUTH_SOCK is not the vs-connect daemon — this looks like \
                  plain agent forwarding. Point ForwardAgent at the vs-connect socket in your \
                  local ssh config (see README)."
             ),
-            _ => bail!("unexpected reply from agent socket"),
         }
     }
     Ok(())
+}
+
+enum Reply {
+    Success,
+    ExtensionFailure(String),
+    Failure,
+}
+
+fn read_reply(stream: &mut UnixStream) -> Result<Reply> {
+    let reply = read_frame(stream).context("waiting for daemon reply")?;
+    match reply.first() {
+        Some(&SSH_AGENT_SUCCESS) => Ok(Reply::Success),
+        Some(&SSH_AGENT_EXTENSION_FAILURE) => Ok(Reply::ExtensionFailure(
+            Cursor::new(&reply[1..])
+                .str()
+                .unwrap_or_else(|_| "unknown error".into()),
+        )),
+        Some(&SSH_AGENT_FAILURE) => Ok(Reply::Failure),
+        _ => anyhow::bail!("unexpected reply from agent socket"),
+    }
 }
 
 /// Diff sides must be existing files — a missing path would only surface as
@@ -446,7 +489,26 @@ mod tests {
 
     #[test]
     fn shim_args_unknown_flag() {
-        assert!(parse_shim_args(["--wait", "a"].iter().map(|s| s.to_string()).collect()).is_err());
+        assert!(
+            parse_shim_args(["--install-extension", "x"].iter().map(|s| s.to_string()).collect())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn shim_args_wait() {
+        let opts =
+            parse_shim_args(["-w", "notes.md"].iter().map(|s| s.to_string()).collect()).unwrap();
+        assert!(opts.wait);
+        assert_eq!(opts.paths, vec!["notes.md"]);
+    }
+
+    #[test]
+    fn wait_rejects_multiple_paths() {
+        let opts =
+            parse_shim_args(["-w", "a", "b"].iter().map(|s| s.to_string()).collect()).unwrap();
+        let err = send_plan(opts).unwrap_err();
+        assert!(err.to_string().contains("--wait supports exactly one path"));
     }
 
     #[test]
