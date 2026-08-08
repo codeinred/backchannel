@@ -160,10 +160,10 @@ impl TestEnv {
         }
     }
 
-    /// Run `backchannel open` against this daemon, as a remote shim would.
-    fn open_cmd(&self, args: &[&str]) -> Command {
+    /// Run a `back <sub>` client against this daemon, as a remote would.
+    fn client_cmd(&self, sub: &str, args: &[&str]) -> Command {
         let mut cmd = Command::new(BIN);
-        cmd.arg("open")
+        cmd.arg(sub)
             .args(args)
             .env("SSH_AUTH_SOCK", self.sock())
             .env_remove("VSCODE_IPC_HOOK_CLI")
@@ -171,8 +171,12 @@ impl TestEnv {
         cmd
     }
 
+    fn code(&self, args: &[&str]) -> std::process::Output {
+        self.client_cmd("code", args).output().unwrap()
+    }
+
     fn open(&self, args: &[&str]) -> std::process::Output {
-        self.open_cmd(args).output().unwrap()
+        self.client_cmd("open", args).output().unwrap()
     }
 
     fn stub_log(&self) -> String {
@@ -224,11 +228,11 @@ fn opens_folder_file_and_diff() {
     let dir = env.dir.to_string_lossy().into_owned();
     let stub = env.dir.join("code-stub.sh").to_string_lossy().into_owned();
 
-    let out = env.open(&[&dir]);
+    let out = env.code(&[&dir]);
     assert!(out.status.success(), "{out:?}");
     env.await_stub_log("--folder-uri vscode-remote://ssh-remote+");
 
-    let out = env.open(&[&format!("{stub}:3:7")]);
+    let out = env.code(&[&format!("{stub}:3:7")]);
     assert!(out.status.success(), "{out:?}");
     let log = env.await_stub_log(":3:7");
     assert!(log.contains("--remote ssh-remote+"), "{log}");
@@ -236,12 +240,12 @@ fn opens_folder_file_and_diff() {
 
     let other = env.dir.join("other.txt");
     std::fs::write(&other, "x").unwrap();
-    let out = env.open(&["-d", &stub, &other.to_string_lossy()]);
+    let out = env.code(&["-d", &stub, &other.to_string_lossy()]);
     assert!(out.status.success(), "{out:?}");
     let log = env.await_stub_log("--diff");
     assert!(log.contains(&format!("--diff {stub} {}", other.display())), "{log}");
 
-    let out = env.open(&["-n", &dir]);
+    let out = env.code(&["-n", &dir]);
     assert!(out.status.success(), "{out:?}");
     env.await_stub_log("--new-window");
 }
@@ -254,7 +258,7 @@ fn wait_blocks_until_editor_closes() {
 
     let stub = env.dir.join("code-stub.sh").to_string_lossy().into_owned();
     let start = Instant::now();
-    let out = env.open(&["-w", &stub]);
+    let out = env.code(&["-w", &stub]);
     let elapsed = start.elapsed();
 
     assert!(out.status.success(), "{out:?}");
@@ -273,7 +277,7 @@ fn wait_propagates_editor_failure() {
     env.start_daemon(&[]);
 
     let stub = env.dir.join("code-stub.sh").to_string_lossy().into_owned();
-    let out = env.open(&["-w", &stub]);
+    let out = env.code(&["-w", &stub]);
     assert!(!out.status.success(), "nonzero editor exit must fail the shim");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("code exited"), "{stderr}");
@@ -284,7 +288,7 @@ fn wait_rejects_multiple_paths() {
     let mut env = TestEnv::new("waitmulti");
     env.write_stub("");
     env.start_daemon(&[]);
-    let out = env.open(&["-w", "/tmp/a", "/tmp/b"]);
+    let out = env.code(&["-w", "/tmp/a", "/tmp/b"]);
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("exactly one path"), "{stderr}");
@@ -300,7 +304,7 @@ fn wait_disconnect_kills_waiting_cli() {
 
     let stub = env.dir.join("code-stub.sh").to_string_lossy().into_owned();
     let mut client = env
-        .open_cmd(&["-w", &stub])
+        .client_cmd("code", &["-w", &stub])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -759,6 +763,122 @@ fn proxy_rejects_non_loopback() {
         "{out:?}"
     );
     assert!(!env.dir.join("ssh.log").exists(), "no tunnel should have been attempted");
+}
+
+fn encode_openfile(basename: &str, hostname: &str, data: &[u8]) -> Vec<u8> {
+    let mut b = Vec::new();
+    put_u32(&mut b, 1);
+    put_str(&mut b, basename);
+    put_str(&mut b, hostname);
+    b.extend_from_slice(data);
+    b
+}
+
+#[test]
+fn open_transfers_files_to_local_default_app() {
+    let mut env = TestEnv::new("openfile");
+    env.write_stub("");
+    let opener = env.dir.join("opener.sh");
+    std::fs::write(
+        &opener,
+        "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/opener.log\"\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let opener_str = opener.to_string_lossy().into_owned();
+    env.start_daemon(&[("BACKCHANNEL_OPENER", opener_str.as_str())]);
+
+    let svg = b"<svg xmlns=\"http://www.w3.org/2000/svg\"><text>flame</text></svg>";
+    let src = env.dir.join("graph.svg");
+    std::fs::write(&src, svg).unwrap();
+
+    // Plain path and file:// URL forms both transfer.
+    for target in [
+        src.to_string_lossy().into_owned(),
+        format!("file://{}", src.display()),
+    ] {
+        std::fs::remove_file(env.dir.join("opener.log")).ok();
+        let out = env.open(&[&target]);
+        assert!(out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("default app"),
+            "{out:?}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let opened = loop {
+            let log = std::fs::read_to_string(env.dir.join("opener.log")).unwrap_or_default();
+            if !log.trim().is_empty() {
+                break log.trim().to_string();
+            }
+            assert!(Instant::now() < deadline, "opener never invoked");
+            std::thread::sleep(Duration::from_millis(25));
+        };
+        // The opened path is a *transferred copy*: same basename and bytes,
+        // different location.
+        let opened = Path::new(&opened);
+        assert_eq!(opened.file_name().unwrap(), "graph.svg");
+        assert_ne!(opened, src);
+        assert_eq!(std::fs::read(opened).unwrap(), svg);
+    }
+
+    // Directories are refused with a pointer at `back code`.
+    let out = env.open(&[&env.dir.to_string_lossy()]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("back code"),
+        "{out:?}"
+    );
+}
+
+#[test]
+fn openfile_sanitizes_names_and_refuses_executables() {
+    let mut env = TestEnv::new("opensafe");
+    env.write_stub("");
+    let opener = env.dir.join("opener.sh");
+    std::fs::write(
+        &opener,
+        "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/opener.log\"\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let opener_str = opener.to_string_lossy().into_owned();
+    env.start_daemon(&[("BACKCHANNEL_OPENER", opener_str.as_str())]);
+
+    // Path traversal in the basename is neutralized to the final component.
+    let mut s = UnixStream::connect(env.sock()).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    send_frame(
+        &mut s,
+        &ext_msg(
+            "openfile@backchannel",
+            &encode_openfile("../../escape.svg", "h", b"<svg/>"),
+        ),
+    );
+    assert_eq!(read_frame(&mut s).unwrap().first(), Some(&SSH_AGENT_SUCCESS));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let log = std::fs::read_to_string(env.dir.join("opener.log")).unwrap_or_default();
+        if !log.trim().is_empty() {
+            let opened = log.trim().to_string();
+            assert!(opened.ends_with("/escape.svg"), "{opened}");
+            assert!(!opened.contains(".."), "{opened}");
+            break;
+        }
+        assert!(Instant::now() < deadline, "opener never invoked");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // Executable-flavored extensions are refused outright.
+    for name in ["evil.command", "evil.desktop", "Evil.APP"] {
+        send_frame(
+            &mut s,
+            &ext_msg("openfile@backchannel", &encode_openfile(name, "h", b"x")),
+        );
+        let reply = read_frame(&mut s).unwrap();
+        assert_eq!(reply.first(), Some(&28), "{name} should be refused: {reply:?}");
+    }
 }
 
 #[test]

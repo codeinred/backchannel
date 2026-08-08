@@ -295,6 +295,19 @@ fn handle_client(
             Some((name, data)) if name == EXT_OPEN => {
                 handle_open(data, peer, &mut stream)?;
             }
+            Some((name, data)) if name == EXT_OPENFILE => {
+                let reply = match handle_open_file(data) {
+                    Ok(summary) => {
+                        logging::info(summary);
+                        success_frame()
+                    }
+                    Err(e) => {
+                        logging::error(format!("open file failed: {e:#}"));
+                        extension_failure(&format!("{e:#}"))
+                    }
+                };
+                write_frame(&mut stream, &reply)?;
+            }
             Some((name, data)) if name == EXT_COPY => {
                 let reply = match handle_copy(data) {
                     Ok(summary) => {
@@ -547,6 +560,56 @@ fn proxy_open(url: &str, alias: &str) -> Result<(String, String)> {
     };
     launch::open_url(&final_url)?;
     Ok((final_url, format!("{alias}:{port}")))
+}
+
+/// Reduce a remote-supplied filename to a bare, viewable basename: strip
+/// any path components (traversal), and refuse extensions the local opener
+/// would *execute* rather than display (.command/.terminal/... on macOS,
+/// .desktop's Exec= on Linux).
+fn safe_basename(raw: &str) -> Result<String> {
+    let name = Path::new(raw)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::to_string)
+        .filter(|n| n != "." && n != "..")
+        .with_context(|| format!("bad filename {raw:?}"))?;
+    const EXECUTABLE_EXTS: &[&str] = &["command", "terminal", "tool", "workflow", "app", "desktop"];
+    if let Some(ext) = Path::new(&name).extension().and_then(|e| e.to_str()) {
+        if EXECUTABLE_EXTS.iter().any(|d| ext.eq_ignore_ascii_case(d)) {
+            bail!("refusing to open {name:?}: .{ext} files execute rather than display");
+        }
+    }
+    Ok(name)
+}
+
+fn handle_open_file(data: &[u8]) -> Result<String> {
+    use std::sync::atomic::AtomicU64;
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let req = OpenFileRequest::decode(data).context("decoding open-file request")?;
+    if req.data.len() > crate::clipboard::MAX_COPY_BYTES {
+        bail!("file payload of {} bytes exceeds the limit", req.data.len());
+    }
+    let name = safe_basename(&req.basename)?;
+    // Fresh directory per request: no collisions, meaningful basename
+    // preserved for app selection, OS temp reaper handles eventual cleanup.
+    let dir = std::env::temp_dir().join("backchannel-open").join(format!(
+        "{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    let path = dir.join(&name);
+    std::fs::write(&path, &req.data).with_context(|| format!("writing {}", path.display()))?;
+    launch::open_with_default(&path.to_string_lossy())?;
+    Ok(format!(
+        "open file {} ({} bytes) from host '{}' -> {}",
+        name,
+        req.data.len(),
+        req.hostname,
+        path.display()
+    ))
 }
 
 fn handle_copy(data: &[u8]) -> Result<String> {

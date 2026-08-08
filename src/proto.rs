@@ -15,6 +15,7 @@ pub const EXT_PING: &str = "ping@backchannel";
 pub const EXT_OPEN: &str = "open@backchannel";
 pub const EXT_SHUTDOWN: &str = "shutdown@backchannel";
 pub const EXT_COPY: &str = "copy@backchannel";
+pub const EXT_OPENFILE: &str = "openfile@backchannel";
 pub const EXT_TUNNELS: &str = "tunnels@backchannel";
 pub const EXT_PROXY_STOP: &str = "proxy-stop@backchannel";
 
@@ -354,6 +355,46 @@ impl CopyRequest {
         let payload = data[c.offset()..].to_vec();
         Ok(CopyRequest {
             kind,
+            hostname,
+            data: payload,
+        })
+    }
+}
+
+/// `back open <file>`: transfer a remote file so the local default app can
+/// open it. The basename is preserved — the local opener picks the app by
+/// extension — but the daemon re-sanitizes it before touching the fs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenFileRequest {
+    pub basename: String,
+    pub hostname: String,
+    pub data: Vec<u8>,
+}
+
+impl OpenFileRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        put_u32(&mut b, 1); // openfile protocol version
+        put_str(&mut b, &self.basename);
+        put_str(&mut b, &self.hostname);
+        b.extend_from_slice(&self.data);
+        b
+    }
+
+    pub fn decode(data: &[u8]) -> io::Result<OpenFileRequest> {
+        let mut c = Cursor::new(data);
+        let version = c.u32()?;
+        if version != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported openfile@backchannel version {version}"),
+            ));
+        }
+        let basename = c.str()?;
+        let hostname = c.str()?;
+        let payload = data[c.offset()..].to_vec();
+        Ok(OpenFileRequest {
+            basename,
             hostname,
             data: payload,
         })

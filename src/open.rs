@@ -20,27 +20,176 @@ pub struct OpenOptions {
     /// Block until the editor is closed (`code --wait`); over the channel
     /// this requires a single path or --diff.
     pub wait: bool,
-    /// Tunnel remote-loopback URLs to this machine (ssh -L, daemon-side)
-    /// before opening them.
-    pub proxy: bool,
     pub paths: Vec<String>,
 }
 
+/// `back code` (and the shim behind it): open in VS Code.
 pub fn run(opts: OpenOptions) -> Result<()> {
-    // URLs are backchannel's own feature — VS Code's CLI would treat them
-    // as file paths, so never defer those to it.
-    let has_url = opts.paths.iter().any(|p| is_url(p));
-    if !has_url {
-        if let Some(cli) = vscode_terminal_cli() {
-            return exec_real_cli(&cli, &to_cli_args(&opts));
-        }
+    if let Some(url) = opts.paths.iter().find(|p| is_url(p)) {
+        bail!("`back code` opens files and folders — use `back open {url}` for URLs");
+    }
+    if let Some(cli) = vscode_terminal_cli() {
+        return exec_real_cli(&cli, &to_cli_args(&opts));
     }
     send_plan(opts)
+}
+
+/// `back open`: like the platform's `open`, but backwards across ssh —
+/// URLs to the local browser (optionally --proxy tunneled), files
+/// transferred and opened with the local default app.
+pub fn run_open(targets: Vec<String>, proxy: bool) -> Result<()> {
+    // file:// URLs name files on *this* machine (tools love printing them);
+    // normalize to plain paths so they transfer like any other file. The
+    // daemon still refuses file:// outright — a URL reaching it would name
+    // files on the wrong machine.
+    let targets = targets
+        .iter()
+        .map(|t| normalize_file_url(t))
+        .collect::<Result<Vec<_>>>()?;
+    if proxy && !targets.iter().all(|t| is_url(t)) {
+        bail!("--proxy applies to http(s) URLs only");
+    }
+    if channel_is_backchannel() {
+        return send_open_verb(targets, proxy);
+    }
+    if in_ssh_session() {
+        bail!(
+            "no backchannel in this ssh session — is the daemon running on your local \
+             machine, and was this session opened after it started? `back status` has details."
+        );
+    }
+    if proxy {
+        bail!("--proxy only makes sense from an ssh session (locally the server is already reachable)");
+    }
+    // In person at this machine: behave like plain `open`.
+    for t in &targets {
+        crate::launch::open_with_default(t)?;
+        eprintln!("opening {t}");
+    }
+    Ok(())
+}
+
+fn send_open_verb(targets: Vec<String>, proxy: bool) -> Result<()> {
+    let sock = std::env::var("SSH_AUTH_SOCK").context("SSH_AUTH_SOCK is not set")?;
+    let mut stream = UnixStream::connect(&sock).with_context(|| {
+        format!("connecting to {sock} — is the backchannel daemon running on your local machine?")
+    })?;
+    // File payloads over slow links need patience.
+    stream.set_read_timeout(Some(Duration::from_secs(60)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(60)))?;
+    let hostname = hostname();
+    let user = std::env::var("USER").unwrap_or_default();
+    let ssh_connection = std::env::var("SSH_CONNECTION").unwrap_or_default();
+
+    for t in &targets {
+        if is_url(t) {
+            let req = OpenRequest {
+                action: Action::Url {
+                    url: t.clone(),
+                    proxy,
+                },
+                window: WindowMode::Default,
+                wait: false,
+                hostname: hostname.clone(),
+                user: user.clone(),
+                ssh_connection: ssh_connection.clone(),
+            };
+            write_frame(&mut stream, &extension(EXT_OPEN, &req.encode()))?;
+            match read_reply(&mut stream)? {
+                Reply::Success(Some((final_url, target))) if proxy => {
+                    println!("opening {final_url} in your local browser (tunneled to {target})")
+                }
+                Reply::Success(_) => println!("opening {t} in your local browser"),
+                Reply::ExtensionFailure(reason) => bail!("daemon error: {reason}"),
+                Reply::Failure => bail!(
+                    "the agent behind SSH_AUTH_SOCK is not the backchannel daemon (see README)"
+                ),
+            }
+            continue;
+        }
+
+        let path = absolutize(Path::new(t));
+        let meta = std::fs::metadata(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if meta.is_dir() {
+            bail!(
+                "{} is a directory — `back open` transfers single files; use `back code {t}` \
+                 to browse it in VS Code",
+                path.display()
+            );
+        }
+        let data = std::fs::read(&path).with_context(|| format!("reading {}", path.display()))?;
+        if data.len() > crate::clipboard::MAX_COPY_BYTES {
+            bail!(
+                "{} is {} bytes, over the {} MiB transfer limit",
+                path.display(),
+                data.len(),
+                crate::clipboard::MAX_COPY_BYTES / (1024 * 1024)
+            );
+        }
+        let basename = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .with_context(|| format!("no filename in {}", path.display()))?;
+        let len = data.len();
+        let req = OpenFileRequest {
+            basename: basename.clone(),
+            hostname: hostname.clone(),
+            data,
+        };
+        write_frame(&mut stream, &extension(EXT_OPENFILE, &req.encode()))?;
+        match read_reply(&mut stream)? {
+            Reply::Success(_) => {
+                println!("opening {basename} ({len} bytes) with the default app on your local machine")
+            }
+            Reply::ExtensionFailure(reason) => bail!("daemon error: {reason}"),
+            Reply::Failure => {
+                bail!("the agent behind SSH_AUTH_SOCK is not the backchannel daemon (see README)")
+            }
+        }
+    }
+    Ok(())
 }
 
 fn is_url(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
     lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+fn normalize_file_url(t: &str) -> Result<String> {
+    if !t.to_ascii_lowercase().starts_with("file://") {
+        return Ok(t.to_string());
+    }
+    let rest = &t["file://".len()..];
+    // file:///path (empty authority) or file://localhost/path
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    if !rest.starts_with('/') {
+        bail!("file URL {t:?} names a different host — file URLs must refer to this machine");
+    }
+    percent_decode(rest)
+}
+
+fn percent_decode(s: &str) -> Result<String> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hex = bytes
+                .get(i + 1..i + 3)
+                .and_then(|h| std::str::from_utf8(h).ok())
+                .with_context(|| format!("truncated percent-escape in {s:?}"))?;
+            out.push(
+                u8::from_str_radix(hex, 16)
+                    .with_context(|| format!("bad percent-escape %{hex} in {s:?}"))?,
+            );
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).context("file URL decodes to non-UTF-8")
 }
 
 /// Reconstruct real-CLI argv from parsed options (for deferring to VS
@@ -154,7 +303,6 @@ fn parse_shim_args(args: Vec<String>) -> Result<OpenOptions> {
         force_goto: false,
         diff: None,
         wait: false,
-        proxy: false,
         paths: Vec::new(),
     };
     let mut diff_flag = false;
@@ -193,12 +341,6 @@ fn send_plan(opts: OpenOptions) -> Result<()> {
         // than ship the wrong semantics.
         bail!("over backchannel, --wait supports exactly one path (or --diff)");
     }
-    if opts.wait && opts.paths.iter().any(|p| is_url(p)) {
-        bail!("--wait is not supported for URLs");
-    }
-    if opts.proxy && (opts.diff.is_some() || !opts.paths.iter().all(|p| is_url(p))) {
-        bail!("--proxy applies to http(s) URLs only");
-    }
     let sock = std::env::var("SSH_AUTH_SOCK").context(
         "SSH_AUTH_SOCK is not set — backchannel needs an ssh session with agent forwarding \
          pointed at the backchannel daemon (see README)",
@@ -224,11 +366,6 @@ fn send_plan(opts: OpenOptions) -> Result<()> {
         requests.push((Action::Diff { left, right }, msg));
     } else {
         for p in &opts.paths {
-            if is_url(p) {
-                let msg = format!("opening {p} in your local browser");
-                requests.push((Action::Url { url: p.clone(), proxy: opts.proxy }, msg));
-                continue;
-            }
             let (kind, path, line, col) = classify_target(p, opts.force_goto);
             let msg = match (line, col) {
                 (0, _) => format!("opening {path}"),
@@ -269,12 +406,9 @@ fn send_plan(opts: OpenOptions) -> Result<()> {
                     Reply::Failure => bail!("unexpected agent failure while waiting"),
                 }
             }
-            Reply::Success(authority) => match (&authority, opts.proxy) {
-                (Some((final_url, target)), true) => {
-                    println!("opening {final_url} in your local browser (tunneled to {target})")
-                }
-                _ => println!("{msg}{}", describe_authority(&authority)),
-            },
+            Reply::Success(authority) => {
+                println!("{msg}{}", describe_authority(&authority))
+            }
             Reply::ExtensionFailure(reason) => bail!("daemon error: {reason}"),
             Reply::Failure => bail!(
                 "the agent behind SSH_AUTH_SOCK is not the backchannel daemon — this looks like \
@@ -584,6 +718,30 @@ mod tests {
         assert_eq!(kind, Kind::File);
         assert_eq!(path, cwd.join("Cargo.toml").to_string_lossy());
         assert_eq!((line, col), (7, 0));
+    }
+
+    #[test]
+    fn file_urls_normalize_to_paths() {
+        assert_eq!(normalize_file_url("/plain/path").unwrap(), "/plain/path");
+        assert_eq!(
+            normalize_file_url("file:///home/x/report.html").unwrap(),
+            "/home/x/report.html"
+        );
+        assert_eq!(
+            normalize_file_url("file://localhost/tmp/a.svg").unwrap(),
+            "/tmp/a.svg"
+        );
+        assert_eq!(
+            normalize_file_url("file:///tmp/with%20space.pdf").unwrap(),
+            "/tmp/with space.pdf"
+        );
+        assert!(normalize_file_url("file://otherhost/etc/passwd").is_err());
+        assert!(normalize_file_url("file:///bad%zz").is_err());
+        // http URLs pass through untouched
+        assert_eq!(
+            normalize_file_url("http://localhost:8000/x").unwrap(),
+            "http://localhost:8000/x"
+        );
     }
 
     #[test]

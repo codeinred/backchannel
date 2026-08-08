@@ -37,7 +37,8 @@ enum Command {
         foreground: bool,
     },
     /// From a remote ssh session: open paths in VS Code on your local machine
-    Open {
+    /// (what the `code` shim runs)
+    Code {
         /// Force a new window
         #[arg(short = 'n', long, conflicts_with = "reuse_window")]
         new_window: bool,
@@ -54,13 +55,19 @@ enum Command {
         /// Block until the editor is closed (single path or --diff)
         #[arg(short = 'w', long)]
         wait: bool,
+        /// Files or folders to open; positions as path:line[:col] jump there
+        #[arg(required_unless_present = "diff")]
+        paths: Vec<String>,
+    },
+    /// Like the platform `open`, but backwards across ssh: URLs open in
+    /// your local browser, files transfer and open with your local default app
+    Open {
         /// Tunnel a remote loopback URL here (ssh -L) before opening it
         #[arg(long)]
         proxy: bool,
-        /// Files, folders, or http(s) URLs to open; positions as
-        /// path:line[:col] jump there
-        #[arg(required_unless_present = "diff")]
-        paths: Vec<String>,
+        /// http(s) URLs or files
+        #[arg(required = true)]
+        targets: Vec<String>,
     },
     /// Copy a file (or stdin) to the clipboard — on your local machine when
     /// run over ssh. Detects text vs image (png/jpeg/gif/tiff) content.
@@ -105,7 +112,7 @@ fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Daemon { replace, foreground } => daemon::run(replace, foreground),
-        Command::Open { new_window, reuse_window, goto, diff, wait, proxy, paths } => {
+        Command::Code { new_window, reuse_window, goto, diff, wait, paths } => {
             open::run(open::OpenOptions {
                 window: if new_window {
                     proto::WindowMode::New
@@ -121,10 +128,10 @@ fn main() -> Result<()> {
                     (left, right)
                 }),
                 wait,
-                proxy,
                 paths,
             })
         }
+        Command::Open { proxy, targets } => open::run_open(targets, proxy),
         Command::Copy { file } => copy::run(file),
         Command::Proxy { action } => match action {
             ProxyAction::List => proxy::list(),

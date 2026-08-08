@@ -120,11 +120,16 @@ pub fn run_code(args: Vec<String>) -> Result<()> {
 
 /// Open a URL in the local default browser.
 pub fn open_url(url: &str) -> Result<()> {
+    open_with_default(url)
+}
+
+/// Hand a URL or file path to the platform's open-with-default-app tool.
+pub fn open_with_default(target: &str) -> Result<()> {
     let opener = find_opener().context(
-        "no URL opener found — install xdg-open, or set BACKCHANNEL_OPENER to a command that \
-         takes a URL argument",
+        "no opener found — install xdg-open (or wslview on WSL), or set BACKCHANNEL_OPENER to \
+         a command that takes a URL/path argument",
     )?;
-    spawn_and_reap(&opener, std::slice::from_ref(&url.to_string()))
+    spawn_and_reap(&opener, std::slice::from_ref(&target.to_string()))
 }
 
 fn find_opener() -> Option<PathBuf> {
@@ -138,7 +143,8 @@ fn find_opener() -> Option<PathBuf> {
             return Some(open);
         }
     }
-    which("xdg-open")
+    // xdg-open on any XDG desktop; wslview bridges to Windows apps on WSL.
+    which("xdg-open").or_else(|| which("wslview"))
 }
 
 /// Launchers exit almost immediately after handing off to the running app;
