@@ -1018,6 +1018,25 @@ fn parse_ssh_connection(s: &str) -> Option<(String, u16)> {
     Some((ip.to_string(), port))
 }
 
+fn alias_lookup(hostname: &str) -> Option<String> {
+    let content = std::fs::read_to_string(paths::aliases_path()).ok()?;
+    let short = hostname.split('.').next().unwrap_or(hostname);
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let (Some(host), Some(alias)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        if host == hostname || host == short {
+            return Some(alias.to_string());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::{is_loopback, parse_ssh_connection, split_url};
@@ -1082,23 +1101,4 @@ mod tests {
         assert_eq!(parse_ssh_connection("1.2.3.4 5 6.7.8.9"), None);
         assert_eq!(parse_ssh_connection("1.2.3.4 5 6.7.8.9 notaport"), None);
     }
-}
-
-fn alias_lookup(hostname: &str) -> Option<String> {
-    let content = std::fs::read_to_string(paths::aliases_path()).ok()?;
-    let short = hostname.split('.').next().unwrap_or(hostname);
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut parts = line.split_whitespace();
-        let (Some(host), Some(alias)) = (parts.next(), parts.next()) else {
-            continue;
-        };
-        if host == hostname || host == short {
-            return Some(alias.to_string());
-        }
-    }
-    None
 }

@@ -34,6 +34,7 @@ pub fn run() -> Result<()> {
     println!("\nthis shell:");
     match std::env::var("SSH_AUTH_SOCK") {
         Err(_) => println!("  SSH_AUTH_SOCK is not set"),
+        Ok(s) if s.is_empty() => println!("  SSH_AUTH_SOCK is set but empty"),
         Ok(s) => match daemon::ping(Path::new(&s)) {
             Ok(Some(r)) => {
                 println!(

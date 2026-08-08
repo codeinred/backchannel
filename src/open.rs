@@ -23,7 +23,10 @@ pub struct OpenOptions {
     pub paths: Vec<String>,
 }
 
-/// `back code` (and the shim behind it): open in VS Code.
+/// `back code`: open in VS Code. Same cascade as the `code` shim — VS Code's
+/// own terminal CLI, then the channel, then (in person at this machine) the
+/// real local VS Code — so `back code .` on the host just opens VS Code
+/// instead of complaining about a channel that has no reason to exist.
 pub fn run(opts: OpenOptions) -> Result<()> {
     if let Some(url) = opts.paths.iter().find(|p| is_url(p)) {
         bail!("`back code` opens files and folders — use `back open {url}` for URLs");
@@ -31,7 +34,22 @@ pub fn run(opts: OpenOptions) -> Result<()> {
     if let Some(cli) = vscode_terminal_cli() {
         return exec_real_cli(&cli, &to_cli_args(&opts));
     }
-    send_plan(opts)
+    if channel_is_backchannel() {
+        return send_plan(opts);
+    }
+    if in_ssh_session() {
+        // A broken channel in an ssh session: launching a local (likely
+        // headless) VS Code here would be far more confusing than an error.
+        bail!(
+            "no backchannel in this ssh session — is the daemon running on your local \
+             machine, and was this session opened after it started? `back status` has \
+             details."
+        );
+    }
+    match find_local_code() {
+        Some(code) => exec_real_cli(&code, &to_cli_args(&opts)),
+        None => bail!("no VS Code installation found on this machine (looked through PATH)"),
+    }
 }
 
 /// `back open`: like the platform's `open`, but backwards across ssh —

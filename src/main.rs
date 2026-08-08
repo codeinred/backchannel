@@ -15,11 +15,14 @@ mod status;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+// Keep the about line in step with Cargo.toml `description` and the README
+// intro; revisit the wording together once the README gets its editorial pass.
 #[derive(Parser)]
 #[command(
     name = "back",
     version,
-    about = "Open VS Code windows on your local machine from remote ssh sessions"
+    about = "Open projects and files on the host machine from within an ssh session, \
+             tunneled over agent forwarding"
 )]
 struct Cli {
     #[command(subcommand)]

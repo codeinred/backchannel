@@ -65,7 +65,7 @@ pub fn mux_control_path(argv: &[String]) -> Option<String> {
     }
 }
 
-fn clean(dest: &String) -> Option<String> {
+fn clean(dest: &str) -> Option<String> {
     let d = dest.strip_prefix("ssh://").unwrap_or(dest);
     let d = d.split('/').next().unwrap_or(d);
     if d.is_empty() {

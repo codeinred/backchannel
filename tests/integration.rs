@@ -1008,10 +1008,10 @@ fn replace_takes_over_and_shutdown_works() {
     assert!(status.success());
     let deadline = Instant::now() + Duration::from_secs(5);
     let second_pid = loop {
-        if let Some(pid) = ping(&env.sock()) {
-            if pid != first_pid {
-                break pid;
-            }
+        if let Some(pid) = ping(&env.sock())
+            && pid != first_pid
+        {
+            break pid;
         }
         assert!(Instant::now() < deadline, "replacement daemon never answered");
         std::thread::sleep(Duration::from_millis(25));
