@@ -38,6 +38,52 @@ fn tunnels() -> &'static Mutex<HashMap<u16, Tunnel>> {
 
 static DAEMONIZED: AtomicBool = AtomicBool::new(false);
 
+/// Learned mapping: mux control-socket path -> alias. ControlPersist
+/// background masters rewrite their argv to "ssh: <controlpath> [mux]",
+/// hiding the destination — but whenever a *foreground* session resolves an
+/// alias via argv, we ask `ssh -G <alias>` for its expanded controlpath and
+/// remember it, so later background masters still resolve exactly.
+struct MuxCache {
+    by_path: HashMap<String, String>,
+    probed: std::collections::HashSet<String>,
+}
+
+static MUX_CACHE: OnceLock<Mutex<MuxCache>> = OnceLock::new();
+
+fn mux_cache() -> &'static Mutex<MuxCache> {
+    MUX_CACHE.get_or_init(|| {
+        Mutex::new(MuxCache {
+            by_path: HashMap::new(),
+            probed: std::collections::HashSet::new(),
+        })
+    })
+}
+
+fn parse_controlpath_output(out: &str) -> Option<String> {
+    out.lines()
+        .find_map(|l| l.strip_prefix("controlpath "))
+        .filter(|p| *p != "none")
+        .map(str::to_string)
+}
+
+fn remember_alias_controlpath(alias: &str) {
+    {
+        let mut cache = mux_cache().lock().unwrap();
+        if !cache.probed.insert(alias.to_string()) {
+            return; // already probed this alias
+        }
+    } // don't hold the lock across the subprocess
+    let out = Command::new("ssh").arg("-G").arg(alias).output();
+    if let Ok(out) = out {
+        if out.status.success() {
+            if let Some(path) = parse_controlpath_output(&String::from_utf8_lossy(&out.stdout)) {
+                logging::info(format!("learned mux control path for '{alias}': {path}"));
+                mux_cache().lock().unwrap().by_path.insert(path, alias.to_string());
+            }
+        }
+    }
+}
+
 enum Existing {
     None,
     Stale,
@@ -887,13 +933,47 @@ fn resolve_alias(
     match peer {
         Some(p) => match peer::process_argv(p.pid) {
             Some(argv) => match ssh_argv::destination(&argv) {
-                Some(dest) => return (dest, "ssh argv"),
-                // The argv is the evidence for diagnosing this (mux-rewritten
-                // titles, ssh flags we don't know) — log it, don't drop it.
-                None => logging::warn(format!(
-                    "no ssh destination recoverable from peer argv (pid {}): {:?} — falling back",
-                    p.pid, argv
-                )),
+                Some(dest) => {
+                    remember_alias_controlpath(&dest);
+                    return (dest, "ssh argv");
+                }
+                None => {
+                    // A ControlPersist background master? Its title carries
+                    // the control path. `ssh -G <candidate>` expands the
+                    // configured ControlPath for a candidate alias — an
+                    // exact path match is proof of which alias this master
+                    // serves. Candidates: the aliases file's mapping, the
+                    // remote's hostname, and its short form.
+                    if let Some(cp) = ssh_argv::mux_control_path(&argv) {
+                        let short = hostname.split('.').next().unwrap_or(hostname);
+                        let mut candidates: Vec<String> = Vec::new();
+                        if let Some(a) = alias_lookup(hostname) {
+                            candidates.push(a);
+                        }
+                        candidates.push(hostname.to_string());
+                        if short != hostname {
+                            candidates.push(short.to_string());
+                        }
+                        for cand in candidates.iter().filter(|c| !c.is_empty()) {
+                            remember_alias_controlpath(cand);
+                        }
+                        if let Some(alias) = mux_cache().lock().unwrap().by_path.get(&cp) {
+                            return (alias.clone(), "mux control path");
+                        }
+                        logging::warn(format!(
+                            "mux master with unrecognized control path {cp} — falling back \
+                             (add a `{hostname} <alias>` line to the aliases file to teach it)"
+                        ));
+                    } else {
+                        // The argv is the evidence for diagnosing this — log
+                        // it, don't drop it.
+                        logging::warn(format!(
+                            "no ssh destination recoverable from peer argv (pid {}): {:?} — \
+                             falling back",
+                            p.pid, argv
+                        ));
+                    }
+                }
             },
             None => logging::warn(format!(
                 "could not read argv of peer process (pid {}) — falling back",
@@ -958,6 +1038,21 @@ mod tests {
             Some(("http".into(), "::1".into(), 3000, "/x".into()))
         );
         assert_eq!(split_url("not a url"), None);
+    }
+
+    #[test]
+    fn parses_controlpath_from_ssh_g() {
+        assert_eq!(
+            super::parse_controlpath_output(
+                "user test-user\ncontrolmaster auto\ncontrolpath /Users/x/.ssh/cm-abc\ncontrolpersist 600\n"
+            ),
+            Some("/Users/x/.ssh/cm-abc".into())
+        );
+        assert_eq!(
+            super::parse_controlpath_output("controlmaster auto\ncontrolpath none\n"),
+            None
+        );
+        assert_eq!(super::parse_controlpath_output("hostname test-host\n"), None);
     }
 
     #[test]

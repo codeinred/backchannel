@@ -51,6 +51,20 @@ pub fn destination(argv: &[String]) -> Option<String> {
     None
 }
 
+/// The control-socket path from a ControlPersist background master's
+/// rewritten title ("ssh: /path/to/socket [mux]"). The alias isn't in the
+/// title, but the daemon can map paths to aliases it has seen before.
+pub fn mux_control_path(argv: &[String]) -> Option<String> {
+    let joined = argv.join(" ");
+    let rest = joined.strip_prefix("ssh: ")?;
+    let (path, _) = rest.split_once(" [mux]")?;
+    if path.is_empty() {
+        None
+    } else {
+        Some(path.to_string())
+    }
+}
+
 fn clean(dest: &String) -> Option<String> {
     let d = dest.strip_prefix("ssh://").unwrap_or(dest);
     let d = d.split('/').next().unwrap_or(d);
@@ -119,6 +133,21 @@ mod tests {
     #[test]
     fn mux_master_is_inconclusive() {
         assert!(destination(&argv(&["ssh: /tmp/ctl [mux]"])).is_none());
+    }
+
+    #[test]
+    fn mux_title_yields_control_path() {
+        assert_eq!(
+            mux_control_path(&argv(&["ssh: /Users/x/.ssh/cm-4dd8bb65 [mux]"])).unwrap(),
+            "/Users/x/.ssh/cm-4dd8bb65"
+        );
+        // macOS argv parsing may split the title on spaces
+        assert_eq!(
+            mux_control_path(&argv(&["ssh:", "/Users/x/.ssh/cm-abc", "[mux]"])).unwrap(),
+            "/Users/x/.ssh/cm-abc"
+        );
+        assert!(mux_control_path(&argv(&["ssh", "test-host"])).is_none());
+        assert!(mux_control_path(&argv(&["ssh: "])).is_none());
     }
 
     #[test]
