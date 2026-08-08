@@ -1,3 +1,5 @@
+mod clipboard;
+mod copy;
 mod daemon;
 mod launch;
 mod logging;
@@ -56,6 +58,12 @@ enum Command {
         #[arg(required_unless_present = "diff")]
         paths: Vec<String>,
     },
+    /// Copy a file (or stdin) to the clipboard — on your local machine when
+    /// run over ssh. Detects text vs image (png/jpeg/gif/tiff) content.
+    Copy {
+        /// File to copy; omit to read from stdin
+        file: Option<String>,
+    },
     /// Report what backchannel can see from here (daemon, sockets, forwarding)
     Status,
 }
@@ -93,6 +101,7 @@ fn main() -> Result<()> {
                 paths,
             })
         }
+        Command::Copy { file } => copy::run(file),
         Command::Status => status::run(),
     }
 }

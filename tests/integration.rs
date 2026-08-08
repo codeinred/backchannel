@@ -480,6 +480,121 @@ fn urls_open_in_local_browser() {
     );
 }
 
+fn write_clipboard_stub(env: &TestEnv) -> String {
+    // Records the kind as an argv line and the payload verbatim.
+    let stub = env.dir.join("clip.sh");
+    std::fs::write(
+        &stub,
+        "#!/bin/sh\necho \"$1\" >> \"$(dirname \"$0\")/clip.log\"\ncat > \"$(dirname \"$0\")/clip.bin\"\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+    stub.to_string_lossy().into_owned()
+}
+
+#[test]
+fn copies_text_and_images_through_the_channel() {
+    let mut env = TestEnv::new("copy");
+    env.write_stub("");
+    let clip = write_clipboard_stub(&env);
+    env.start_daemon(&[("BACKCHANNEL_CLIPBOARD", clip.as_str())]);
+
+    // Text from stdin.
+    let mut child = Command::new(BIN)
+        .arg("copy")
+        .env("SSH_AUTH_SOCK", env.sock())
+        .env_remove("SSH_CONNECTION")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all("hello clipboard: héllo\n".as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        std::fs::read(env.dir.join("clip.bin")).unwrap(),
+        "hello clipboard: héllo\n".as_bytes()
+    );
+    assert!(std::fs::read_to_string(env.dir.join("clip.log")).unwrap().contains("text"));
+
+    // Image from a file (PNG magic is enough for detection).
+    let png: Vec<u8> = [b"\x89PNG\r\n\x1a\n".as_slice(), &[7u8; 300]].concat();
+    let img = env.dir.join("shot.png");
+    std::fs::write(&img, &png).unwrap();
+    let out = Command::new(BIN)
+        .arg("copy")
+        .arg(&img)
+        .env("SSH_AUTH_SOCK", env.sock())
+        .env_remove("SSH_CONNECTION")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(std::fs::read(env.dir.join("clip.bin")).unwrap(), png);
+    assert!(std::fs::read_to_string(env.dir.join("clip.log")).unwrap().contains("image/png"));
+}
+
+#[test]
+fn copy_sets_local_clipboard_without_a_channel() {
+    let env = TestEnv::new("copylocal");
+    let clip = write_clipboard_stub(&env);
+    let mut child = Command::new(BIN)
+        .arg("copy")
+        .env("BACKCHANNEL_CLIPBOARD", &clip)
+        .env_remove("SSH_AUTH_SOCK")
+        .env_remove("SSH_CONNECTION")
+        .env_remove("SSH_CLIENT")
+        .env_remove("SSH_TTY")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"local text").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(std::fs::read(env.dir.join("clip.bin")).unwrap(), b"local text");
+}
+
+#[test]
+fn copy_rejects_oversized_and_binary_junk() {
+    let env = TestEnv::new("copybad");
+    let clip = write_clipboard_stub(&env);
+    let base_env = |cmd: &mut Command| {
+        cmd.env("BACKCHANNEL_CLIPBOARD", &clip)
+            .env_remove("SSH_AUTH_SOCK")
+            .env_remove("SSH_CONNECTION")
+            .env_remove("SSH_CLIENT")
+            .env_remove("SSH_TTY");
+    };
+
+    let big = env.dir.join("big.txt");
+    std::fs::write(&big, vec![b'a'; 61 * 1024 * 1024]).unwrap();
+    let mut cmd = Command::new(BIN);
+    base_env(cmd.arg("copy").arg(&big));
+    let out = cmd.output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("exceeds"), "{out:?}");
+
+    let junk = env.dir.join("junk.bin");
+    std::fs::write(&junk, [0x00u8, 0xFF, 0xFE, 0x01]).unwrap();
+    let mut cmd = Command::new(BIN);
+    base_env(cmd.arg("copy").arg(&junk));
+    let out = cmd.output().unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("neither UTF-8 text nor a recognized image"),
+        "{out:?}"
+    );
+    assert!(!env.dir.join("clip.bin").exists(), "nothing should have been copied");
+}
+
 #[test]
 fn replace_takes_over_and_shutdown_works() {
     let mut env = TestEnv::new("replace");

@@ -97,14 +97,14 @@ pub fn run_as_code_shim(args: Vec<String>) -> Result<()> {
 }
 
 /// True when $SSH_AUTH_SOCK answers as a backchannel daemon.
-fn channel_is_backchannel() -> bool {
+pub(crate) fn channel_is_backchannel() -> bool {
     let Some(sock) = std::env::var_os("SSH_AUTH_SOCK").filter(|s| !s.is_empty()) else {
         return false;
     };
     matches!(crate::daemon::ping(Path::new(&sock)), Ok(Some(_)))
 }
 
-fn in_ssh_session() -> bool {
+pub(crate) fn in_ssh_session() -> bool {
     ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]
         .iter()
         .any(|v| std::env::var_os(v).is_some_and(|s| !s.is_empty()))
@@ -276,7 +276,7 @@ fn send_plan(opts: OpenOptions) -> Result<()> {
     Ok(())
 }
 
-enum Reply {
+pub(crate) enum Reply {
     /// Success, with the resolved authority and its source when the daemon
     /// sent them (0.4.1+).
     Success(Option<(String, String)>),
@@ -294,7 +294,7 @@ fn describe_authority(authority: &Option<(String, String)>) -> String {
     }
 }
 
-fn read_reply(stream: &mut UnixStream) -> Result<Reply> {
+pub(crate) fn read_reply(stream: &mut UnixStream) -> Result<Reply> {
     let reply = read_frame(stream).context("waiting for daemon reply")?;
     match reply.first() {
         Some(&SSH_AGENT_SUCCESS) => {
@@ -416,7 +416,7 @@ fn absolutize(p: &Path) -> PathBuf {
     out
 }
 
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     let mut buf = [0u8; 256];
     let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
     if rc != 0 {

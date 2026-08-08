@@ -14,10 +14,11 @@ pub const SSH_AGENT_EXTENSION_FAILURE: u8 = 28;
 pub const EXT_PING: &str = "ping@backchannel";
 pub const EXT_OPEN: &str = "open@backchannel";
 pub const EXT_SHUTDOWN: &str = "shutdown@backchannel";
+pub const EXT_COPY: &str = "copy@backchannel";
 
 /// Far above any legitimate agent message; bounds memory against a
-/// misbehaving peer.
-const MAX_FRAME: u32 = 1 << 20;
+/// misbehaving peer. Sized for clipboard payloads (images) with headroom.
+const MAX_FRAME: u32 = 64 << 20;
 
 pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     let mut len = [0u8; 4];
@@ -313,6 +314,45 @@ impl OpenRequest {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyRequest {
+    /// "text" or an image mime ("image/png", "image/jpeg", "image/gif",
+    /// "image/tiff") — detected remote-side from the content.
+    pub kind: String,
+    pub hostname: String,
+    pub data: Vec<u8>,
+}
+
+impl CopyRequest {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::new();
+        put_u32(&mut b, 1); // copy protocol version
+        put_str(&mut b, &self.kind);
+        put_str(&mut b, &self.hostname);
+        b.extend_from_slice(&self.data);
+        b
+    }
+
+    pub fn decode(data: &[u8]) -> io::Result<CopyRequest> {
+        let mut c = Cursor::new(data);
+        let version = c.u32()?;
+        if version != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported copy@backchannel version {version}"),
+            ));
+        }
+        let kind = c.str()?;
+        let hostname = c.str()?;
+        let payload = data[c.offset()..].to_vec();
+        Ok(CopyRequest {
+            kind,
+            hostname,
+            data: payload,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PingReply {
     pub version: String,
@@ -449,6 +489,16 @@ mod tests {
             }
         );
         assert_eq!(req.window, WindowMode::Default);
+    }
+
+    #[test]
+    fn copy_request_roundtrip() {
+        let req = CopyRequest {
+            kind: "image/png".into(),
+            hostname: "test-host".into(),
+            data: vec![0x89, b'P', b'N', b'G', 0, 1, 2, 3],
+        };
+        assert_eq!(CopyRequest::decode(&req.encode()).unwrap(), req);
     }
 
     #[test]

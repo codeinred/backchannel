@@ -246,6 +246,19 @@ fn handle_client(
             Some((name, data)) if name == EXT_OPEN => {
                 handle_open(data, peer, &mut stream)?;
             }
+            Some((name, data)) if name == EXT_COPY => {
+                let reply = match handle_copy(data) {
+                    Ok(summary) => {
+                        logging::info(summary);
+                        success_frame()
+                    }
+                    Err(e) => {
+                        logging::error(format!("copy failed: {e:#}"));
+                        extension_failure(&format!("{e:#}"))
+                    }
+                };
+                write_frame(&mut stream, &reply)?;
+            }
             // Anything else — identities, signing, session-bind@openssh.com,
             // unknown extensions — is real agent traffic. Relay verbatim.
             _ => {
@@ -293,6 +306,20 @@ fn proxy_roundtrip(
         }
     }
     unreachable!()
+}
+
+fn handle_copy(data: &[u8]) -> Result<String> {
+    let req = CopyRequest::decode(data).context("decoding copy request")?;
+    if req.data.len() > crate::clipboard::MAX_COPY_BYTES {
+        bail!("copy payload of {} bytes exceeds the limit", req.data.len());
+    }
+    crate::clipboard::set(&req.kind, &req.data)?;
+    Ok(format!(
+        "copy {} ({} bytes) from host '{}'",
+        req.kind,
+        req.data.len(),
+        req.hostname
+    ))
 }
 
 /// Decode and act on an open request, writing the reply frame(s) to the
