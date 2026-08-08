@@ -596,7 +596,7 @@ fn copy_rejects_oversized_and_binary_junk() {
     };
 
     let big = env.dir.join("big.txt");
-    std::fs::write(&big, vec![b'a'; 61 * 1024 * 1024]).unwrap();
+    std::fs::write(&big, vec![b'a'; 201 * 1024 * 1024]).unwrap();
     let mut cmd = Command::new(BIN);
     base_env(cmd.arg("copy").arg(&big));
     let out = cmd.output().unwrap();

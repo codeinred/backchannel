@@ -137,11 +137,20 @@ fn send_open_verb(targets: Vec<String>, proxy: bool) -> Result<()> {
             hostname: hostname.clone(),
             data,
         };
-        write_frame(&mut stream, &extension(EXT_OPENFILE, &req.encode()))?;
+        let stats = crate::progress::write_frame_with_progress(
+            &mut stream,
+            &extension(EXT_OPENFILE, &req.encode()),
+            &basename,
+        )?;
         match read_reply(&mut stream)? {
-            Reply::Success(_) => {
-                println!("opening {basename} ({len} bytes) with the default app on your local machine")
-            }
+            Reply::Success(_) => match stats.summary() {
+                Some(summary) => println!(
+                    "opening {basename} ({summary}) with the default app on your local machine"
+                ),
+                None => println!(
+                    "opening {basename} ({len} bytes) with the default app on your local machine"
+                ),
+            },
             Reply::ExtensionFailure(reason) => bail!("daemon error: {reason}"),
             Reply::Failure => {
                 bail!("the agent behind SSH_AUTH_SOCK is not the backchannel daemon (see README)")

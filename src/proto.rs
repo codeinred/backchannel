@@ -20,8 +20,9 @@ pub const EXT_TUNNELS: &str = "tunnels@backchannel";
 pub const EXT_PROXY_STOP: &str = "proxy-stop@backchannel";
 
 /// Far above any legitimate agent message; bounds memory against a
-/// misbehaving peer. Sized for clipboard payloads (images) with headroom.
-const MAX_FRAME: u32 = 64 << 20;
+/// misbehaving peer. Sized for file-transfer payloads (large PDFs/images)
+/// with headroom.
+const MAX_FRAME: u32 = 256 << 20;
 
 pub fn read_frame<R: Read>(r: &mut R) -> io::Result<Vec<u8>> {
     let mut len = [0u8; 4];

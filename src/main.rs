@@ -6,6 +6,7 @@ mod logging;
 mod open;
 mod paths;
 mod peer;
+mod progress;
 mod proto;
 mod proxy;
 mod ssh_argv;

@@ -69,10 +69,21 @@ fn send_copy(kind: &'static str, data: Vec<u8>) -> Result<()> {
         hostname: hostname(),
         data,
     };
-    write_frame(&mut stream, &extension(EXT_COPY, &req.encode()))?;
+    let stats = crate::progress::write_frame_with_progress(
+        &mut stream,
+        &extension(EXT_COPY, &req.encode()),
+        "clipboard",
+    )?;
     match read_reply(&mut stream)? {
         Reply::Success(_) => {
-            eprintln!("copied {len} bytes ({kind}) to the clipboard on your local machine");
+            match stats.summary() {
+                Some(summary) => eprintln!(
+                    "copied {kind} to the clipboard on your local machine ({summary})"
+                ),
+                None => eprintln!(
+                    "copied {len} bytes ({kind}) to the clipboard on your local machine"
+                ),
+            }
             Ok(())
         }
         Reply::ExtensionFailure(reason) => bail!("daemon error: {reason}"),

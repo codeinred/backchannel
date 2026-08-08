@@ -8,8 +8,9 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
-/// Client-side payload cap; MAX_FRAME (64 MiB) leaves headroom above this.
-pub const MAX_COPY_BYTES: usize = 60 * 1024 * 1024;
+/// Client-side payload cap (copy and open-file transfers); MAX_FRAME
+/// (256 MiB) leaves headroom above this.
+pub const MAX_COPY_BYTES: usize = 200 * 1024 * 1024;
 
 /// Sniff content: known image magics first, then UTF-8 text. None means
 /// "refuse rather than corrupt someone's clipboard".
