@@ -541,8 +541,16 @@ fn spawn_tunnel(alias: &str, local: u16, remote: u16) -> Result<Child> {
     // BatchMode: a headless daemon must fail fast, never hang on a prompt.
     // ExitOnForwardFailure: a failed bind must kill the child (detectable),
     // not leave a connected ssh with no forwarding (ssh's silent default).
+    // ControlPath=none: under ControlMaster/ControlPersist the forwarding
+    // would be installed in a shared mux master and this child would exit
+    // immediately — leaving the registry (which keys tunnel liveness on the
+    // child, for list/stop/reuse) pointing at a dead pid while the listener
+    // lives on, unstoppable, in the master. Owning the connection keeps
+    // "child alive" == "tunnel alive", and ExitOnForwardFailure detectable.
     Command::new(&ssh)
         .arg("-N")
+        .arg("-o")
+        .arg("ControlPath=none")
         .arg("-o")
         .arg("ExitOnForwardFailure=yes")
         .arg("-o")
