@@ -74,14 +74,12 @@ fn remember_alias_controlpath(alias: &str) {
         }
     } // don't hold the lock across the subprocess
     let out = Command::new("ssh").arg("-G").arg(alias).output();
-    if let Ok(out) = out {
-        if out.status.success() {
-            if let Some(path) = parse_controlpath_output(&String::from_utf8_lossy(&out.stdout)) {
+    if let Ok(out) = out
+        && out.status.success()
+            && let Some(path) = parse_controlpath_output(&String::from_utf8_lossy(&out.stdout)) {
                 logging::info(format!("learned mux control path for '{alias}': {path}"));
                 mux_cache().lock().unwrap().by_path.insert(path, alias.to_string());
             }
-        }
-    }
 }
 
 enum Existing {
@@ -280,15 +278,14 @@ fn handle_client(
     sock_path: &Path,
 ) -> Result<()> {
     let peer = peer::peer_info(&stream).ok();
-    if let Some(p) = peer {
-        if p.uid != my_uid {
+    if let Some(p) = peer
+        && p.uid != my_uid {
             logging::warn(format!(
                 "rejecting connection from uid {} (pid {})",
                 p.uid, p.pid
             ));
             return Ok(());
         }
-    }
 
     // One upstream connection per client connection mirrors the client's
     // lifetime and keeps any agent-side per-connection state coherent.
@@ -631,11 +628,10 @@ fn safe_basename(raw: &str) -> Result<String> {
         .filter(|n| n != "." && n != "..")
         .with_context(|| format!("bad filename {raw:?}"))?;
     const EXECUTABLE_EXTS: &[&str] = &["command", "terminal", "tool", "workflow", "app", "desktop"];
-    if let Some(ext) = Path::new(&name).extension().and_then(|e| e.to_str()) {
-        if EXECUTABLE_EXTS.iter().any(|d| ext.eq_ignore_ascii_case(d)) {
+    if let Some(ext) = Path::new(&name).extension().and_then(|e| e.to_str())
+        && EXECUTABLE_EXTS.iter().any(|d| ext.eq_ignore_ascii_case(d)) {
             bail!("refusing to open {name:?}: .{ext} files execute rather than display");
         }
-    }
     Ok(name)
 }
 
@@ -994,11 +990,10 @@ fn resolve_alias(
         return (alias, "aliases file");
     }
     let endpoint = parse_ssh_connection(ssh_connection);
-    if let Some((ip, _)) = &endpoint {
-        if let Some(alias) = alias_lookup(ip) {
+    if let Some((ip, _)) = &endpoint
+        && let Some(alias) = alias_lookup(ip) {
             return (alias, "aliases file (by ip)");
         }
-    }
     if let Some((ip, port)) = endpoint {
         let mut authority = String::new();
         if !user.is_empty() {

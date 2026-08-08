@@ -21,8 +21,8 @@ pub fn run(file: Option<String>) -> Result<()> {
     // Large files with a path: have the daemon pull over a real ssh
     // connection instead of the slow agent channel. (Stdin has no path to
     // pull, so it always goes inline.)
-    if let Some(p) = &file {
-        if channel_is_backchannel() {
+    if let Some(p) = &file
+        && channel_is_backchannel() {
             let abs = std::fs::canonicalize(p).with_context(|| format!("reading {p}"))?;
             let meta = std::fs::metadata(&abs)?;
             if meta.is_file() && meta.len() >= pull_threshold() {
@@ -63,7 +63,6 @@ pub fn run(file: Option<String>) -> Result<()> {
                 }
             }
         }
-    }
 
     let data = match &file {
         Some(p) => std::fs::read(p).with_context(|| format!("reading {p}"))?,

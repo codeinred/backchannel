@@ -37,11 +37,10 @@ impl Progress {
         if !self.enabled || self.start.elapsed() < SHOW_AFTER {
             return;
         }
-        if let Some(t) = self.last_draw {
-            if t.elapsed() < REDRAW_EVERY && sent < self.total {
+        if let Some(t) = self.last_draw
+            && t.elapsed() < REDRAW_EVERY && sent < self.total {
                 return;
             }
-        }
         self.last_draw = Some(Instant::now());
         eprint!("\r{}", render(&self.label, sent, self.total, self.start.elapsed()));
         let _ = std::io::stderr().flush();

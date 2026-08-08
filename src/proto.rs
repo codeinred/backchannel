@@ -281,7 +281,7 @@ impl OpenRequest {
                     ssh_connection: String::new(),
                 })
             }
-            v @ (2 | 3 | 4) => {
+            v @ (2..=4) => {
                 let window = c.str()?;
                 let window = WindowMode::parse(&window)
                     .ok_or_else(|| bad(format!("bad window mode {window:?}")))?;

@@ -580,12 +580,11 @@ fn classify_target(raw: &str, force_goto: bool) -> (Kind, String, u32, u32) {
     let literal = absolutize(Path::new(raw));
     let literal_meta = std::fs::metadata(&literal).ok();
 
-    if !force_goto {
-        if let Some(m) = &literal_meta {
+    if !force_goto
+        && let Some(m) = &literal_meta {
             let kind = if m.is_dir() { Kind::Folder } else { Kind::File };
             return (kind, literal.to_string_lossy().into_owned(), 0, 0);
         }
-    }
 
     if let Some((base, line, col)) = split_goto_suffix(raw) {
         let base_abs = absolutize(Path::new(base));
@@ -623,13 +622,11 @@ fn classify_target(raw: &str, force_goto: bool) -> (Kind, String, u32, u32) {
 fn split_goto_suffix(raw: &str) -> Option<(&str, u32, u32)> {
     let (rest, last) = raw.rsplit_once(':')?;
     let last_num: u32 = last.parse().ok()?;
-    if let Some((base, mid)) = rest.rsplit_once(':') {
-        if let Ok(line) = mid.parse::<u32>() {
-            if !base.is_empty() {
+    if let Some((base, mid)) = rest.rsplit_once(':')
+        && let Ok(line) = mid.parse::<u32>()
+            && !base.is_empty() {
                 return Some((base, line, last_num)); // base:line:col
             }
-        }
-    }
     if rest.is_empty() {
         None
     } else {
