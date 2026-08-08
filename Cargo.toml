@@ -8,7 +8,7 @@ repository = "https://github.com/codeinred/backchannel"
 readme = "README.md"
 keywords = ["ssh", "remote", "clipboard", "vscode", "agent-forwarding"]
 categories = ["command-line-utilities", "development-tools", "network-programming"]
-exclude = ["justfile"]
+exclude = ["justfile", "tests/live.py"]
 
 # The crate keeps the good name; the binary is short for fingers (rg/fd style).
 [[bin]]
