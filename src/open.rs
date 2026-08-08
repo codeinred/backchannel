@@ -9,11 +9,43 @@ use anyhow::{Context, Result, bail};
 
 use crate::proto::*;
 
-pub fn run(paths: Vec<String>) -> Result<()> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenOptions {
+    pub window: WindowMode,
+    /// -g: parse path:line[:col] even when a file with the literal colon
+    /// name exists (that parse is otherwise the default only for names that
+    /// don't exist as-is).
+    pub force_goto: bool,
+    pub diff: Option<(String, String)>,
+    pub paths: Vec<String>,
+}
+
+pub fn run(opts: OpenOptions) -> Result<()> {
     if let Some(cli) = vscode_terminal_cli() {
-        return exec_real_cli(&cli, &paths);
+        return exec_real_cli(&cli, &to_cli_args(&opts));
     }
-    send_open(paths)
+    send_plan(opts)
+}
+
+/// Reconstruct real-CLI argv from parsed options (for deferring to VS
+/// Code's own CLI inside its terminals).
+fn to_cli_args(opts: &OpenOptions) -> Vec<String> {
+    let mut v = Vec::new();
+    match opts.window {
+        WindowMode::New => v.push("--new-window".into()),
+        WindowMode::Reuse => v.push("--reuse-window".into()),
+        WindowMode::Default => {}
+    }
+    if opts.force_goto {
+        v.push("--goto".into());
+    }
+    if let Some((l, r)) = &opts.diff {
+        v.push("--diff".into());
+        v.push(l.clone());
+        v.push(r.clone());
+    }
+    v.extend(opts.paths.iter().cloned());
+    v
 }
 
 /// Invoked via a symlink named `code`. Precedence: VS Code's own remote CLI
@@ -25,18 +57,7 @@ pub fn run_as_code_shim(args: Vec<String>) -> Result<()> {
         return exec_real_cli(&cli, &args);
     }
     if channel_is_vs_connect() {
-        let (flags, paths): (Vec<String>, Vec<String>) =
-            args.into_iter().partition(|a| a.starts_with('-'));
-        if !flags.is_empty() {
-            bail!(
-                "unsupported flag(s) {}: over vs-connect this `code` shim only accepts file/folder paths",
-                flags.join(" ")
-            );
-        }
-        if paths.is_empty() {
-            bail!("usage: code <path>...");
-        }
-        return send_open(paths);
+        return send_plan(parse_shim_args(args)?);
     }
     if in_ssh_session() {
         // A broken channel in an ssh session: launching a local (likely
@@ -102,7 +123,42 @@ fn find_local_code() -> Option<PathBuf> {
     fallbacks.into_iter().find(|p| p.is_file())
 }
 
-fn send_open(paths: Vec<String>) -> Result<()> {
+fn parse_shim_args(args: Vec<String>) -> Result<OpenOptions> {
+    let mut opts = OpenOptions {
+        window: WindowMode::Default,
+        force_goto: false,
+        diff: None,
+        paths: Vec::new(),
+    };
+    let mut diff_flag = false;
+    for a in args {
+        match a.as_str() {
+            "-n" | "--new-window" => opts.window = WindowMode::New,
+            "-r" | "--reuse-window" => opts.window = WindowMode::Reuse,
+            "-g" | "--goto" => opts.force_goto = true,
+            "-d" | "--diff" => diff_flag = true,
+            s if s.starts_with('-') => bail!(
+                "unsupported flag {s} over vs-connect (supported: -n/--new-window, \
+                 -r/--reuse-window, -g/--goto, -d/--diff)"
+            ),
+            _ => opts.paths.push(a),
+        }
+    }
+    if diff_flag {
+        if opts.paths.len() != 2 {
+            bail!("--diff needs exactly two files");
+        }
+        let right = opts.paths.pop().expect("checked len");
+        let left = opts.paths.pop().expect("checked len");
+        opts.diff = Some((left, right));
+    }
+    if opts.diff.is_none() && opts.paths.is_empty() {
+        bail!("usage: code [-n|-r] [-g] <path[:line[:col]]>...  |  code -d <left> <right>");
+    }
+    Ok(opts)
+}
+
+fn send_plan(opts: OpenOptions) -> Result<()> {
     let sock = std::env::var("SSH_AUTH_SOCK").context(
         "SSH_AUTH_SOCK is not set — vs-connect needs an ssh session with agent forwarding \
          pointed at the vs-connect daemon (see README)",
@@ -114,18 +170,35 @@ fn send_open(paths: Vec<String>) -> Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
 
-    for p in &paths {
-        let (kind, abs) = classify(p);
+    let mut requests: Vec<(Action, String)> = Vec::new();
+    if let Some((l, r)) = &opts.diff {
+        let left = diff_target(l)?;
+        let right = diff_target(r)?;
+        let msg = format!("diffing {left} and {right}");
+        requests.push((Action::Diff { left, right }, msg));
+    } else {
+        for p in &opts.paths {
+            let (kind, path, line, col) = classify_target(p, opts.force_goto);
+            let msg = match (line, col) {
+                (0, _) => format!("opening {path}"),
+                (l, 0) => format!("opening {path} at line {l}"),
+                (l, c) => format!("opening {path} at {l}:{c}"),
+            };
+            requests.push((Action::Open { kind, path, line, col }, msg));
+        }
+    }
+
+    for (action, msg) in requests {
         let req = OpenRequest {
-            kind,
-            path: abs.clone(),
+            action,
+            window: opts.window,
             hostname: hostname.clone(),
         };
         write_frame(&mut stream, &extension(EXT_OPEN, &req.encode()))?;
         let reply = read_frame(&mut stream).context("waiting for daemon reply")?;
         match reply.first() {
             Some(&SSH_AGENT_SUCCESS) => {
-                println!("opening {abs} in VS Code on your local machine");
+                println!("{msg} in VS Code on your local machine");
             }
             Some(&SSH_AGENT_EXTENSION_FAILURE) => {
                 let reason = Cursor::new(&reply[1..])
@@ -144,17 +217,82 @@ fn send_open(paths: Vec<String>) -> Result<()> {
     Ok(())
 }
 
-fn classify(p: &str) -> (Kind, String) {
+/// Diff sides must be existing files — a missing path would only surface as
+/// an error dialog in a freshly opened window, so fail here instead.
+fn diff_target(p: &str) -> Result<String> {
     let abs = absolutize(Path::new(p));
-    let kind = match std::fs::metadata(&abs) {
-        Ok(m) if m.is_dir() => Kind::Folder,
-        Ok(_) => Kind::File,
-        Err(_) => {
-            eprintln!("note: {} does not exist; opening as a file", abs.display());
-            Kind::File
+    match std::fs::metadata(&abs) {
+        Ok(m) if m.is_dir() => bail!("--diff compares files, and {} is a directory", abs.display()),
+        Ok(_) => Ok(abs.to_string_lossy().into_owned()),
+        Err(_) => bail!("diff target {} does not exist", abs.display()),
+    }
+}
+
+/// Turn a shim argument into (kind, absolute path, line, col).
+///
+/// Goto is the default: `foo.rs:10:5` jumps to 10:5. A file whose literal
+/// name contains the colons (rare, but possible) wins over the goto parse
+/// unless -g forces it — mirroring how VS Code treats -g, with existence as
+/// the tiebreak.
+fn classify_target(raw: &str, force_goto: bool) -> (Kind, String, u32, u32) {
+    let literal = absolutize(Path::new(raw));
+    let literal_meta = std::fs::metadata(&literal).ok();
+
+    if !force_goto {
+        if let Some(m) = &literal_meta {
+            let kind = if m.is_dir() { Kind::Folder } else { Kind::File };
+            return (kind, literal.to_string_lossy().into_owned(), 0, 0);
         }
-    };
-    (kind, abs.to_string_lossy().into_owned())
+    }
+
+    if let Some((base, line, col)) = split_goto_suffix(raw) {
+        let base_abs = absolutize(Path::new(base));
+        match std::fs::metadata(&base_abs) {
+            // Positions are meaningless on a folder ("backup:2024" etc.)
+            Ok(m) if m.is_dir() => {
+                return (Kind::Folder, base_abs.to_string_lossy().into_owned(), 0, 0);
+            }
+            Ok(_) => return (Kind::File, base_abs.to_string_lossy().into_owned(), line, col),
+            Err(_) => {
+                if literal_meta.is_none() {
+                    eprintln!(
+                        "note: {} does not exist; opening as a new file",
+                        base_abs.display()
+                    );
+                    return (Kind::File, base_abs.to_string_lossy().into_owned(), line, col);
+                }
+                // -g was forced but only the literal name exists — use it.
+            }
+        }
+    }
+
+    match literal_meta {
+        Some(m) if m.is_dir() => (Kind::Folder, literal.to_string_lossy().into_owned(), 0, 0),
+        Some(_) => (Kind::File, literal.to_string_lossy().into_owned(), 0, 0),
+        None => {
+            eprintln!("note: {} does not exist; opening as a file", literal.display());
+            (Kind::File, literal.to_string_lossy().into_owned(), 0, 0)
+        }
+    }
+}
+
+/// Some((base, line, col)) when `raw` ends in :line or :line:col with
+/// numeric parts. col is 0 when absent.
+fn split_goto_suffix(raw: &str) -> Option<(&str, u32, u32)> {
+    let (rest, last) = raw.rsplit_once(':')?;
+    let last_num: u32 = last.parse().ok()?;
+    if let Some((base, mid)) = rest.rsplit_once(':') {
+        if let Ok(line) = mid.parse::<u32>() {
+            if !base.is_empty() {
+                return Some((base, line, last_num)); // base:line:col
+            }
+        }
+    }
+    if rest.is_empty() {
+        None
+    } else {
+        Some((rest, last_num, 0)) // base:line
+    }
 }
 
 /// Absolute + lexically cleaned (., ..), symlinks left alone so the window
@@ -257,5 +395,74 @@ mod tests {
     fn absolutize_joins_cwd() {
         let cwd = std::env::current_dir().unwrap();
         assert_eq!(absolutize(Path::new("sub/file")), cwd.join("sub/file"));
+    }
+
+    #[test]
+    fn goto_suffix_line_only() {
+        assert_eq!(split_goto_suffix("a/b.rs:10"), Some(("a/b.rs", 10, 0)));
+    }
+
+    #[test]
+    fn goto_suffix_line_and_col() {
+        assert_eq!(split_goto_suffix("a/b.rs:10:5"), Some(("a/b.rs", 10, 5)));
+    }
+
+    #[test]
+    fn goto_suffix_absent() {
+        assert_eq!(split_goto_suffix("a/b.rs"), None);
+        assert_eq!(split_goto_suffix("a/b.rs:x"), None);
+        assert_eq!(split_goto_suffix(":10"), None);
+    }
+
+    #[test]
+    fn goto_suffix_nonnumeric_middle_falls_back_to_line() {
+        // "v1.2:30" — only the trailing :30 is positional.
+        assert_eq!(split_goto_suffix("v1.2:30"), Some(("v1.2", 30, 0)));
+    }
+
+    #[test]
+    fn shim_args_flags() {
+        let opts = parse_shim_args(
+            ["-n", "-g", "src/x.rs:3"].iter().map(|s| s.to_string()).collect(),
+        )
+        .unwrap();
+        assert_eq!(opts.window, WindowMode::New);
+        assert!(opts.force_goto);
+        assert_eq!(opts.paths, vec!["src/x.rs:3"]);
+    }
+
+    #[test]
+    fn shim_args_diff() {
+        let opts =
+            parse_shim_args(["--diff", "a", "b"].iter().map(|s| s.to_string()).collect()).unwrap();
+        assert_eq!(opts.diff, Some(("a".into(), "b".into())));
+        assert!(opts.paths.is_empty());
+    }
+
+    #[test]
+    fn shim_args_diff_wrong_arity() {
+        assert!(parse_shim_args(["-d", "a"].iter().map(|s| s.to_string()).collect()).is_err());
+    }
+
+    #[test]
+    fn shim_args_unknown_flag() {
+        assert!(parse_shim_args(["--wait", "a"].iter().map(|s| s.to_string()).collect()).is_err());
+    }
+
+    #[test]
+    fn classify_existing_file_with_colon_suffix_takes_position() {
+        // The repo's own Cargo.toml exists; Cargo.toml:7 does not.
+        let cwd = std::env::current_dir().unwrap();
+        let (kind, path, line, col) = classify_target("Cargo.toml:7", false);
+        assert_eq!(kind, Kind::File);
+        assert_eq!(path, cwd.join("Cargo.toml").to_string_lossy());
+        assert_eq!((line, col), (7, 0));
+    }
+
+    #[test]
+    fn classify_existing_dir_wins_over_goto() {
+        let (kind, _, line, _) = classify_target("src", false);
+        assert_eq!(kind, Kind::Folder);
+        assert_eq!(line, 0);
     }
 }

@@ -305,17 +305,29 @@ fn proxy_roundtrip(
 fn handle_open(data: &[u8], peer: Option<peer::PeerInfo>) -> Result<()> {
     let req = OpenRequest::decode(data).context("decoding open request")?;
     let (alias, how) = resolve_alias(peer, &req.hostname);
-    let uri = launch::remote_uri(&alias, &req.path);
+    let args = launch::code_args(&alias, &req.action, req.window);
     logging::info(format!(
-        "open {} {} from host '{}' (alias '{}' via {}) -> {}",
-        req.kind.as_str(),
-        req.path,
+        "{} from host '{}' (alias '{}' via {}) -> code {}",
+        describe(&req.action),
         req.hostname,
         alias,
         how,
-        uri
+        args.join(" ")
     ));
-    launch::open_uri(req.kind, &uri)
+    launch::run_code(args)
+}
+
+fn describe(action: &Action) -> String {
+    match action {
+        Action::Open { kind, path, line: 0, .. } => format!("open {} {}", kind.as_str(), path),
+        Action::Open { kind, path, line, col: 0 } => {
+            format!("open {} {}:{}", kind.as_str(), path, line)
+        }
+        Action::Open { kind, path, line, col } => {
+            format!("open {} {}:{}:{}", kind.as_str(), path, line, col)
+        }
+        Action::Diff { left, right } => format!("diff {} <-> {}", left, right),
+    }
 }
 
 /// Best source first: the argv of the ssh process that carried the request,

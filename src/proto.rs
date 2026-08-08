@@ -145,10 +145,48 @@ impl Kind {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowMode {
+    Default,
+    New,
+    Reuse,
+}
+
+impl WindowMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            WindowMode::Default => "default",
+            WindowMode::New => "new",
+            WindowMode::Reuse => "reuse",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<WindowMode> {
+        match s {
+            "default" => Some(WindowMode::Default),
+            "new" => Some(WindowMode::New),
+            "reuse" => Some(WindowMode::Reuse),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Action {
+    /// line/col are 1-based; 0 means "not specified".
+    Open {
+        kind: Kind,
+        path: String,
+        line: u32,
+        col: u32,
+    },
+    Diff { left: String, right: String },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenRequest {
-    pub kind: Kind,
-    pub path: String,
+    pub action: Action,
+    pub window: WindowMode,
     /// Hostname of the sending machine — the alias fallback when the daemon
     /// can't identify the ssh process that carried the request.
     pub hostname: String,
@@ -157,30 +195,77 @@ pub struct OpenRequest {
 impl OpenRequest {
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::new();
-        put_u32(&mut b, 1); // protocol version
-        put_str(&mut b, self.kind.as_str());
-        put_str(&mut b, &self.path);
+        put_u32(&mut b, 2); // protocol version
+        put_str(&mut b, self.window.as_str());
+        match &self.action {
+            Action::Open { kind, path, line, col } => {
+                put_str(&mut b, "open");
+                put_str(&mut b, kind.as_str());
+                put_str(&mut b, path);
+                put_u32(&mut b, *line);
+                put_u32(&mut b, *col);
+            }
+            Action::Diff { left, right } => {
+                put_str(&mut b, "diff");
+                put_str(&mut b, left);
+                put_str(&mut b, right);
+            }
+        }
         put_str(&mut b, &self.hostname);
         b
     }
 
     pub fn decode(data: &[u8]) -> io::Result<OpenRequest> {
+        let bad = |msg: String| io::Error::new(io::ErrorKind::InvalidData, msg);
         let mut c = Cursor::new(data);
-        let version = c.u32()?;
-        if version < 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unsupported open@vs-connect version {version}"),
-            ));
+        match c.u32()? {
+            // v1: kind, path, hostname (pre-0.2 remotes)
+            1 => {
+                let kind = c.str()?;
+                let kind =
+                    Kind::parse(&kind).ok_or_else(|| bad(format!("bad kind {kind:?}")))?;
+                Ok(OpenRequest {
+                    action: Action::Open {
+                        kind,
+                        path: c.str()?,
+                        line: 0,
+                        col: 0,
+                    },
+                    window: WindowMode::Default,
+                    hostname: c.str()?,
+                })
+            }
+            2 => {
+                let window = c.str()?;
+                let window = WindowMode::parse(&window)
+                    .ok_or_else(|| bad(format!("bad window mode {window:?}")))?;
+                let tag = c.str()?;
+                let action = match tag.as_str() {
+                    "open" => {
+                        let kind = c.str()?;
+                        let kind = Kind::parse(&kind)
+                            .ok_or_else(|| bad(format!("bad kind {kind:?}")))?;
+                        Action::Open {
+                            kind,
+                            path: c.str()?,
+                            line: c.u32()?,
+                            col: c.u32()?,
+                        }
+                    }
+                    "diff" => Action::Diff {
+                        left: c.str()?,
+                        right: c.str()?,
+                    },
+                    other => return Err(bad(format!("bad action {other:?}"))),
+                };
+                Ok(OpenRequest {
+                    action,
+                    window,
+                    hostname: c.str()?,
+                })
+            }
+            v => Err(bad(format!("unsupported open@vs-connect version {v}"))),
         }
-        let kind = c.str()?;
-        let kind = Kind::parse(&kind)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("bad kind {kind:?}")))?;
-        Ok(OpenRequest {
-            kind,
-            path: c.str()?,
-            hostname: c.str()?,
-        })
     }
 }
 
@@ -255,11 +340,62 @@ mod tests {
     #[test]
     fn open_request_roundtrip() {
         let req = OpenRequest {
-            kind: Kind::Folder,
-            path: "/opt/pages/vtz".into(),
+            action: Action::Open {
+                kind: Kind::Folder,
+                path: "/opt/pages/vtz".into(),
+                line: 0,
+                col: 0,
+            },
+            window: WindowMode::Default,
             hostname: "test-host.example.com".into(),
         };
         assert_eq!(OpenRequest::decode(&req.encode()).unwrap(), req);
+    }
+
+    #[test]
+    fn goto_and_diff_roundtrip() {
+        let req = OpenRequest {
+            action: Action::Open {
+                kind: Kind::File,
+                path: "/a/b.rs".into(),
+                line: 100,
+                col: 5,
+            },
+            window: WindowMode::New,
+            hostname: "h".into(),
+        };
+        assert_eq!(OpenRequest::decode(&req.encode()).unwrap(), req);
+
+        let req = OpenRequest {
+            action: Action::Diff {
+                left: "/a".into(),
+                right: "/b".into(),
+            },
+            window: WindowMode::Reuse,
+            hostname: "h".into(),
+        };
+        assert_eq!(OpenRequest::decode(&req.encode()).unwrap(), req);
+    }
+
+    #[test]
+    fn decodes_v1_requests() {
+        // A 0.1.x remote: version 1, kind/path/hostname only.
+        let mut b = Vec::new();
+        put_u32(&mut b, 1);
+        put_str(&mut b, "file");
+        put_str(&mut b, "/etc/hosts");
+        put_str(&mut b, "old-host");
+        let req = OpenRequest::decode(&b).unwrap();
+        assert_eq!(
+            req.action,
+            Action::Open {
+                kind: Kind::File,
+                path: "/etc/hosts".into(),
+                line: 0,
+                col: 0
+            }
+        );
+        assert_eq!(req.window, WindowMode::Default);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 
 use crate::logging;
-use crate::proto::Kind;
+use crate::proto::{Kind, WindowMode};
 
 /// Encode everything except unreserved chars and '/', so paths with spaces
 /// and unicode survive the URI trip.
@@ -24,6 +24,48 @@ pub fn remote_uri(alias: &str, path: &str) -> String {
         alias,
         utf8_percent_encode(path, PATH_SEGMENT)
     )
+}
+
+/// The argv for the local `code` CLI. Folders go through --folder-uri;
+/// files ride --remote + --goto so positions work; diffs ride --remote +
+/// --diff. Plain paths (not URIs) are fine with --remote because the shim
+/// always sends absolute paths.
+pub fn code_args(alias: &str, action: &crate::proto::Action, window: WindowMode) -> Vec<String> {
+    use crate::proto::Action;
+    let mut args: Vec<String> = Vec::new();
+    match window {
+        WindowMode::New => args.push("--new-window".into()),
+        WindowMode::Reuse => args.push("--reuse-window".into()),
+        WindowMode::Default => {}
+    }
+    let authority = format!("ssh-remote+{alias}");
+    match action {
+        Action::Open { kind: Kind::Folder, path, .. } => {
+            args.push("--folder-uri".into());
+            args.push(remote_uri(alias, path));
+        }
+        Action::Open { kind: Kind::File, path, line, col } => {
+            args.push("--remote".into());
+            args.push(authority);
+            args.push("--goto".into());
+            let mut target = path.clone();
+            if *line > 0 {
+                target.push_str(&format!(":{line}"));
+                if *col > 0 {
+                    target.push_str(&format!(":{col}"));
+                }
+            }
+            args.push(target);
+        }
+        Action::Diff { left, right } => {
+            args.push("--remote".into());
+            args.push(authority);
+            args.push("--diff".into());
+            args.push(left.clone());
+            args.push(right.clone());
+        }
+    }
+    args
 }
 
 fn which(name: &str) -> Option<PathBuf> {
@@ -56,17 +98,12 @@ pub fn find_code() -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
-pub fn open_uri(kind: Kind, uri: &str) -> Result<()> {
+pub fn run_code(args: Vec<String>) -> Result<()> {
     let code = find_code().context(
         "could not find the `code` CLI — install VS Code's shell command or set VS_CONNECT_CODE",
     )?;
-    let flag = match kind {
-        Kind::Folder => "--folder-uri",
-        Kind::File => "--file-uri",
-    };
     let child = Command::new(&code)
-        .arg(flag)
-        .arg(uri)
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -105,6 +142,45 @@ mod tests {
         assert_eq!(
             remote_uri("user@host", "/srv"),
             "vscode-remote://ssh-remote+user@host/srv"
+        );
+    }
+
+    #[test]
+    fn args_for_folder() {
+        use crate::proto::Action;
+        assert_eq!(
+            code_args(
+                "test-host",
+                &Action::Open { kind: Kind::Folder, path: "/opt".into(), line: 0, col: 0 },
+                WindowMode::New
+            ),
+            vec!["--new-window", "--folder-uri", "vscode-remote://ssh-remote+test-host/opt"]
+        );
+    }
+
+    #[test]
+    fn args_for_file_with_position() {
+        use crate::proto::Action;
+        assert_eq!(
+            code_args(
+                "test-host",
+                &Action::Open { kind: Kind::File, path: "/a/b.rs".into(), line: 10, col: 5 },
+                WindowMode::Default
+            ),
+            vec!["--remote", "ssh-remote+test-host", "--goto", "/a/b.rs:10:5"]
+        );
+    }
+
+    #[test]
+    fn args_for_diff() {
+        use crate::proto::Action;
+        assert_eq!(
+            code_args(
+                "test-host",
+                &Action::Diff { left: "/a".into(), right: "/b".into() },
+                WindowMode::Reuse
+            ),
+            vec!["--reuse-window", "--remote", "ssh-remote+test-host", "--diff", "/a", "/b"]
         );
     }
 }

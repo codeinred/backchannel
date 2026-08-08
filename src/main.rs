@@ -35,8 +35,21 @@ enum Command {
     },
     /// From a remote ssh session: open paths in VS Code on your local machine
     Open {
-        /// Files or folders to open
-        #[arg(required = true)]
+        /// Force a new window
+        #[arg(short = 'n', long, conflicts_with = "reuse_window")]
+        new_window: bool,
+        /// Reuse the last active window
+        #[arg(short = 'r', long)]
+        reuse_window: bool,
+        /// Treat args as path:line[:col] even if a file with the literal
+        /// (colon-containing) name exists
+        #[arg(short = 'g', long = "goto")]
+        goto: bool,
+        /// Compare two files
+        #[arg(short = 'd', long, num_args = 2, value_names = ["LEFT", "RIGHT"])]
+        diff: Option<Vec<String>>,
+        /// Files or folders to open; positions as path:line[:col] jump there
+        #[arg(required_unless_present = "diff")]
         paths: Vec<String>,
     },
     /// Report what vs-connect can see from here (daemon, sockets, forwarding)
@@ -57,7 +70,24 @@ fn main() -> Result<()> {
 
     match Cli::parse().command {
         Command::Daemon { replace, foreground } => daemon::run(replace, foreground),
-        Command::Open { paths } => open::run(paths),
+        Command::Open { new_window, reuse_window, goto, diff, paths } => {
+            open::run(open::OpenOptions {
+                window: if new_window {
+                    proto::WindowMode::New
+                } else if reuse_window {
+                    proto::WindowMode::Reuse
+                } else {
+                    proto::WindowMode::Default
+                },
+                force_goto: goto,
+                diff: diff.map(|mut v| {
+                    let right = v.pop().expect("clap enforces two values");
+                    let left = v.pop().expect("clap enforces two values");
+                    (left, right)
+                }),
+                paths,
+            })
+        }
         Command::Status => status::run(),
     }
 }
