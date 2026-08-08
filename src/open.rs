@@ -24,10 +24,20 @@ pub struct OpenOptions {
 }
 
 pub fn run(opts: OpenOptions) -> Result<()> {
-    if let Some(cli) = vscode_terminal_cli() {
-        return exec_real_cli(&cli, &to_cli_args(&opts));
+    // URLs are backchannel's own feature — VS Code's CLI would treat them
+    // as file paths, so never defer those to it.
+    let has_url = opts.paths.iter().any(|p| is_url(p));
+    if !has_url {
+        if let Some(cli) = vscode_terminal_cli() {
+            return exec_real_cli(&cli, &to_cli_args(&opts));
+        }
     }
     send_plan(opts)
+}
+
+fn is_url(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
 }
 
 /// Reconstruct real-CLI argv from parsed options (for deferring to VS
@@ -63,14 +73,20 @@ pub fn run_as_code_shim(args: Vec<String>) -> Result<()> {
         return exec_real_cli(&cli, &args);
     }
     if channel_is_backchannel() {
-        return send_plan(parse_shim_args(args)?);
+        let opts = parse_shim_args(args)?;
+        // Mirror the real `code`, which treats URLs as paths: refuse with a
+        // pointer instead of surprising either way.
+        if let Some(url) = opts.paths.iter().find(|p| is_url(p)) {
+            bail!("`code` doesn't open URLs — use `back open {url}`");
+        }
+        return send_plan(opts);
     }
     if in_ssh_session() {
         // A broken channel in an ssh session: launching a local (likely
         // headless) VS Code here would be far more confusing than an error.
         bail!(
             "no backchannel in this ssh session — is the daemon running on your local \
-             machine, and was this session opened after it started? `backchannel status` has \
+             machine, and was this session opened after it started? `back status` has \
              details."
         );
     }
@@ -103,7 +119,7 @@ fn find_local_code() -> Option<PathBuf> {
     let is_backchannel_shim = |p: &Path| match p.canonicalize() {
         Ok(c) => {
             Some(&c) == self_exe.as_ref()
-                || c.file_name().is_some_and(|n| n == "backchannel")
+                || c.file_name().is_some_and(|n| n == "back" || n == "backchannel")
         }
         Err(_) => true, // unresolvable → not launchable anyway
     };
@@ -173,6 +189,9 @@ fn send_plan(opts: OpenOptions) -> Result<()> {
         // than ship the wrong semantics.
         bail!("over backchannel, --wait supports exactly one path (or --diff)");
     }
+    if opts.wait && opts.paths.iter().any(|p| is_url(p)) {
+        bail!("--wait is not supported for URLs");
+    }
     let sock = std::env::var("SSH_AUTH_SOCK").context(
         "SSH_AUTH_SOCK is not set — backchannel needs an ssh session with agent forwarding \
          pointed at the backchannel daemon (see README)",
@@ -194,17 +213,25 @@ fn send_plan(opts: OpenOptions) -> Result<()> {
     if let Some((l, r)) = &opts.diff {
         let left = diff_target(l)?;
         let right = diff_target(r)?;
-        let msg = format!("diffing {left} and {right}");
+        let msg = format!("diffing {left} and {right} in VS Code on your local machine");
         requests.push((Action::Diff { left, right }, msg));
     } else {
         for p in &opts.paths {
+            if is_url(p) {
+                let msg = format!("opening {p} in your local browser");
+                requests.push((Action::Url { url: p.clone() }, msg));
+                continue;
+            }
             let (kind, path, line, col) = classify_target(p, opts.force_goto);
             let msg = match (line, col) {
                 (0, _) => format!("opening {path}"),
                 (l, 0) => format!("opening {path} at line {l}"),
                 (l, c) => format!("opening {path} at {l}:{c}"),
             };
-            requests.push((Action::Open { kind, path, line, col }, msg));
+            requests.push((
+                Action::Open { kind, path, line, col },
+                format!("{msg} in VS Code on your local machine"),
+            ));
         }
     }
 
@@ -226,7 +253,7 @@ fn send_plan(opts: OpenOptions) -> Result<()> {
                 // our reply until it closes. Status goes to stderr so tools
                 // capturing stdout (EDITOR consumers) see nothing extra.
                 eprintln!(
-                    "{msg} in VS Code on your local machine{}; waiting until closed...",
+                    "{msg}{}; waiting until closed...",
                     describe_authority(&authority)
                 );
                 match read_reply(&mut stream).context("waiting for the editor to close")? {
@@ -235,10 +262,9 @@ fn send_plan(opts: OpenOptions) -> Result<()> {
                     Reply::Failure => bail!("unexpected agent failure while waiting"),
                 }
             }
-            Reply::Success(authority) => println!(
-                "{msg} in VS Code on your local machine{}",
-                describe_authority(&authority)
-            ),
+            Reply::Success(authority) => {
+                println!("{msg}{}", describe_authority(&authority))
+            }
             Reply::ExtensionFailure(reason) => bail!("daemon error: {reason}"),
             Reply::Failure => bail!(
                 "the agent behind SSH_AUTH_SOCK is not the backchannel daemon — this looks like \

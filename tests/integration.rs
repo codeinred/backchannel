@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const BIN: &str = env!("CARGO_BIN_EXE_backchannel");
+const BIN: &str = env!("CARGO_BIN_EXE_back");
 
 // ---- wire format helpers (independent reimplementation) ----
 
@@ -412,6 +412,71 @@ fn ssh_connection_provides_fallback_authority() {
     assert!(
         log.contains("--remote ssh-remote+tester@203.0.113.26"),
         "expected SSH_CONNECTION-derived authority; got:\n{log}"
+    );
+}
+
+#[test]
+fn urls_open_in_local_browser() {
+    let mut env = TestEnv::new("url");
+    env.write_stub("");
+    // Opener stub records what would reach the browser.
+    let opener = env.dir.join("opener.sh");
+    std::fs::write(
+        &opener,
+        "#!/bin/sh\necho \"$@\" >> \"$(dirname \"$0\")/opener.log\"\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&opener, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let opener_str = opener.to_string_lossy().into_owned();
+    env.start_daemon(&[("BACKCHANNEL_OPENER", opener_str.as_str())]);
+
+    let out = env.open(&["https://example.com/a?b=1"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("local browser"),
+        "{out:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let log = std::fs::read_to_string(env.dir.join("opener.log")).unwrap_or_default();
+        if log.contains("https://example.com/a?b=1") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "opener never invoked; log: {log}");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+
+    // Non-http(s) schemes must be refused by the daemon, not opened.
+    let mut s = UnixStream::connect(env.sock()).unwrap();
+    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut b = Vec::new();
+    put_u32(&mut b, 4);
+    put_str(&mut b, "default");
+    put_u32(&mut b, 0);
+    put_str(&mut b, "url");
+    put_str(&mut b, "file:///etc/passwd");
+    put_str(&mut b, "h");
+    put_str(&mut b, "u");
+    put_str(&mut b, "");
+    send_frame(&mut s, &ext_msg("open@backchannel", &b));
+    let reply = read_frame(&mut s).unwrap();
+    assert_eq!(reply.first(), Some(&28), "expected extension failure, got {reply:?}");
+
+    // The `code` shim points at `back open` instead of opening URLs.
+    let code_link = env.dir.join("code");
+    std::os::unix::fs::symlink(BIN, &code_link).unwrap();
+    let out = Command::new(&code_link)
+        .arg("https://example.com")
+        .env("SSH_AUTH_SOCK", env.sock())
+        .env_remove("VSCODE_IPC_HOOK_CLI")
+        .env_remove("SSH_CONNECTION")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("back open"),
+        "{out:?}"
     );
 }
 

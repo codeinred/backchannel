@@ -22,7 +22,7 @@ pub fn run() -> Result<()> {
                 println!("  log:     {}", paths::log_path().display());
             }
             _ => println!(
-                "  socket {} exists but nothing answered (stale) — `backchannel daemon` will clean it up",
+                "  socket {} exists but nothing answered (stale) — `back daemon` will clean it up",
                 sock.display()
             ),
         }

@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(
-    name = "backchannel",
+    name = "back",
     version,
     about = "Open VS Code windows on your local machine from remote ssh sessions"
 )]
@@ -51,7 +51,8 @@ enum Command {
         /// Block until the editor is closed (single path or --diff)
         #[arg(short = 'w', long)]
         wait: bool,
-        /// Files or folders to open; positions as path:line[:col] jump there
+        /// Files, folders, or http(s) URLs to open; positions as
+        /// path:line[:col] jump there
         #[arg(required_unless_present = "diff")]
         paths: Vec<String>,
     },

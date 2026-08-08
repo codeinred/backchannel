@@ -37,7 +37,7 @@ pub fn run(replace: bool, foreground: bool) -> Result<()> {
     match probe_existing(&sock_path) {
         // Quiet: shell rcs run this on every new terminal, so the expected
         // outcomes (started / already running) print nothing; only errors
-        // reach stderr. `backchannel status` is the interactive view.
+        // reach stderr. `back status` is the interactive view.
         Existing::Alive(_) if !replace => return Ok(()),
         Existing::Alive(pid) => {
             logging::info(format!("replacing running daemon (pid {pid})"));
@@ -313,6 +313,25 @@ fn handle_open(
         Ok(r) => r,
         Err(e) => return fail(stream, &e),
     };
+
+    // URLs go to the local browser, not VS Code; no authority to resolve.
+    if let Action::Url { url } = &req.action {
+        if req.wait {
+            return fail(stream, &anyhow::anyhow!("--wait is not supported for URLs"));
+        }
+        let lower = url.to_ascii_lowercase();
+        if !(lower.starts_with("http://") || lower.starts_with("https://")) {
+            // A remote must not be able to trigger arbitrary local scheme
+            // handlers (file:, ssh:, app-registered schemes, ...).
+            return fail(stream, &anyhow::anyhow!("refusing non-http(s) URL {url:?}"));
+        }
+        logging::info(format!("open url {} from host '{}'", url, req.hostname));
+        return match launch::open_url(url) {
+            Ok(()) => Ok(write_frame(stream, &success_frame())?),
+            Err(e) => fail(stream, &e),
+        };
+    }
+
     let (alias, how) = resolve_alias(peer, &req);
     let args = launch::code_args(&alias, &req.action, req.window, req.wait);
     logging::info(format!(
@@ -363,6 +382,7 @@ fn describe(action: &Action) -> String {
             format!("open {} {}:{}:{}", kind.as_str(), path, line, col)
         }
         Action::Diff { left, right } => format!("diff {} <-> {}", left, right),
+        Action::Url { url } => format!("open url {}", url),
     }
 }
 

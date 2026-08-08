@@ -191,6 +191,9 @@ pub enum Action {
         col: u32,
     },
     Diff { left: String, right: String },
+    /// Open in the local default browser (http/https only, enforced
+    /// daemon-side).
+    Url { url: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +233,10 @@ impl OpenRequest {
                 put_str(&mut b, "diff");
                 put_str(&mut b, left);
                 put_str(&mut b, right);
+            }
+            Action::Url { url } => {
+                put_str(&mut b, "url");
+                put_str(&mut b, url);
             }
         }
         put_str(&mut b, &self.hostname);
@@ -283,6 +290,7 @@ impl OpenRequest {
                         left: c.str()?,
                         right: c.str()?,
                     },
+                    "url" => Action::Url { url: c.str()? },
                     other => return Err(bad(format!("bad action {other:?}"))),
                 };
                 let hostname = c.str()?;

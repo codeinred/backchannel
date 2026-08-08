@@ -75,6 +75,8 @@ pub fn code_args(
             args.push(left.clone());
             args.push(right.clone());
         }
+        // URLs never reach the code CLI; the daemon routes them to open_url.
+        Action::Url { .. } => unreachable!("URL actions are handled before code_args"),
     }
     args
 }
@@ -113,24 +115,52 @@ pub fn run_code(args: Vec<String>) -> Result<()> {
     let code = find_code().context(
         "could not find the `code` CLI — install VS Code's shell command or set BACKCHANNEL_CODE",
     )?;
-    let child = Command::new(&code)
-        .args(&args)
+    spawn_and_reap(&code, &args)
+}
+
+/// Open a URL in the local default browser.
+pub fn open_url(url: &str) -> Result<()> {
+    let opener = find_opener().context(
+        "no URL opener found — install xdg-open, or set BACKCHANNEL_OPENER to a command that \
+         takes a URL argument",
+    )?;
+    spawn_and_reap(&opener, std::slice::from_ref(&url.to_string()))
+}
+
+fn find_opener() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("BACKCHANNEL_OPENER") {
+        return Some(PathBuf::from(p));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let open = PathBuf::from("/usr/bin/open");
+        if open.is_file() {
+            return Some(open);
+        }
+    }
+    which("xdg-open")
+}
+
+/// Launchers exit almost immediately after handing off to the running app;
+/// reap off-thread so we can reply to the remote without waiting, while
+/// still logging launcher failures.
+fn spawn_and_reap(program: &PathBuf, args: &[String]) -> Result<()> {
+    let child = Command::new(program)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("spawning {}", code.display()))?;
+        .with_context(|| format!("spawning {}", program.display()))?;
 
-    // `code` exits almost immediately after handing the URI to the running
-    // app; reap it off-thread so we can reply to the remote without waiting,
-    // while still logging launcher failures.
+    let name = program.display().to_string();
     std::thread::spawn(move || match child.wait_with_output() {
         Ok(out) if !out.status.success() => logging::warn(format!(
-            "code exited with {}: {}",
+            "{name} exited with {}: {}",
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
         )),
-        Err(e) => logging::warn(format!("waiting on code: {e}")),
+        Err(e) => logging::warn(format!("waiting on {name}: {e}")),
         _ => {}
     });
     Ok(())
