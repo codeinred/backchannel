@@ -194,12 +194,18 @@ pub struct OpenRequest {
     /// Hostname of the sending machine — the alias fallback when the daemon
     /// can't identify the ssh process that carried the request.
     pub hostname: String,
+    /// Remote $USER and $SSH_CONNECTION ("client_ip client_port server_ip
+    /// server_port") — lets the daemon fall back to a user@server_ip
+    /// authority that is guaranteed reachable, since this very connection
+    /// runs over it.
+    pub user: String,
+    pub ssh_connection: String,
 }
 
 impl OpenRequest {
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Vec::new();
-        put_u32(&mut b, 3); // protocol version
+        put_u32(&mut b, 4); // protocol version
         put_str(&mut b, self.window.as_str());
         put_u32(&mut b, self.wait as u32);
         match &self.action {
@@ -217,6 +223,8 @@ impl OpenRequest {
             }
         }
         put_str(&mut b, &self.hostname);
+        put_str(&mut b, &self.user);
+        put_str(&mut b, &self.ssh_connection);
         b
     }
 
@@ -239,9 +247,11 @@ impl OpenRequest {
                     window: WindowMode::Default,
                     wait: false,
                     hostname: c.str()?,
+                    user: String::new(),
+                    ssh_connection: String::new(),
                 })
             }
-            v @ (2 | 3) => {
+            v @ (2 | 3 | 4) => {
                 let window = c.str()?;
                 let window = WindowMode::parse(&window)
                     .ok_or_else(|| bad(format!("bad window mode {window:?}")))?;
@@ -265,11 +275,19 @@ impl OpenRequest {
                     },
                     other => return Err(bad(format!("bad action {other:?}"))),
                 };
+                let hostname = c.str()?;
+                let (user, ssh_connection) = if v >= 4 {
+                    (c.str()?, c.str()?)
+                } else {
+                    (String::new(), String::new())
+                };
                 Ok(OpenRequest {
                     action,
                     window,
                     wait,
-                    hostname: c.str()?,
+                    hostname,
+                    user,
+                    ssh_connection,
                 })
             }
             v => Err(bad(format!("unsupported open@vs-connect version {v}"))),
@@ -357,6 +375,8 @@ mod tests {
             window: WindowMode::Default,
             wait: false,
             hostname: "test-host.example.com".into(),
+            user: String::new(),
+            ssh_connection: String::new(),
         };
         assert_eq!(OpenRequest::decode(&req.encode()).unwrap(), req);
     }
@@ -373,6 +393,8 @@ mod tests {
             window: WindowMode::New,
             wait: true,
             hostname: "h".into(),
+            user: "test-user".into(),
+            ssh_connection: "1.2.3.4 5 6.7.8.9 22".into(),
         };
         assert_eq!(OpenRequest::decode(&req.encode()).unwrap(), req);
 
@@ -384,6 +406,8 @@ mod tests {
             window: WindowMode::Reuse,
             wait: false,
             hostname: "h".into(),
+            user: String::new(),
+            ssh_connection: String::new(),
         };
         assert_eq!(OpenRequest::decode(&req.encode()).unwrap(), req);
     }

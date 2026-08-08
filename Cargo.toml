@@ -1,6 +1,6 @@
 [package]
 name = "vs-connect"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Open VS Code windows on your local machine from remote ssh sessions, tunneled over agent forwarding"
 license = "MIT"

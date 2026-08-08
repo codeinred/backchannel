@@ -172,45 +172,105 @@ pub fn spawn_code_waiting(args: &[String]) -> Result<WaitingCode> {
 /// connection dies (remote Ctrl-C, dropped ssh session) — in which case the
 /// CLI is killed so it doesn't wait forever. The editor window itself stays
 /// open either way, matching native `code -w` behavior on interrupt.
-pub fn wait_until_closed(mut wc: WaitingCode, client: &UnixStream) -> Result<()> {
-    let _ = client.set_read_timeout(Some(Duration::from_millis(200)));
-    let result = loop {
-        match wc.child.try_wait() {
-            Ok(Some(status)) if status.success() => break Ok(()),
-            Ok(Some(status)) => {
-                let stderr = wc
-                    .stderr_rx
+///
+/// Event-driven, no polling: a waiter thread turns child-exit into a byte
+/// on a socketpair, and poll(2) sleeps on that alongside the client fd.
+/// Client readiness is inspected with MSG_PEEK only — nothing is consumed,
+/// so a frame a client sends mid-wait stays intact for the caller's frame
+/// loop once the wait resolves.
+pub fn wait_until_closed(wc: WaitingCode, client: &UnixStream) -> Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let WaitingCode {
+        mut child,
+        stderr_rx,
+    } = wc;
+    let pid = child.id() as libc::pid_t;
+    let (status_tx, status_rx) = std::sync::mpsc::channel();
+    let (mut exit_w, exit_r) =
+        UnixStream::pair().context("creating exit-notification socketpair")?;
+    std::thread::spawn(move || {
+        let status = child.wait();
+        let _ = status_tx.send(status);
+        let _ = std::io::Write::write_all(&mut exit_w, &[1]);
+    });
+
+    let mut disconnected = false;
+    // Set to -1 (which poll ignores) once the client needs no more watching.
+    let mut client_fd = client.as_raw_fd();
+    loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: exit_r.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: client_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+        if rc < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            return Err(anyhow!("poll failed during --wait: {e}"));
+        }
+
+        if fds[0].revents != 0 {
+            // Child exited (naturally, or from our SIGTERM after disconnect).
+            let status = match status_rx.recv() {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => return Err(anyhow!("waiting on code: {e}")),
+                Err(_) => return Err(anyhow!("child waiter thread vanished")),
+            };
+            return if disconnected {
+                Err(anyhow!("remote client disconnected during --wait"))
+            } else if status.success() {
+                Ok(())
+            } else {
+                let stderr = stderr_rx
                     .recv_timeout(Duration::from_secs(1))
                     .unwrap_or_default();
-                break Err(anyhow!("code exited with {status}: {}", stderr.trim()));
-            }
-            Ok(None) => {}
-            Err(e) => break Err(anyhow!("waiting on code: {e}")),
+                Err(anyhow!("code exited with {status}: {}", stderr.trim()))
+            };
         }
-        // The client sends nothing while it waits, so any read is either a
-        // timeout (keep polling) or EOF/error (client is gone).
-        let mut probe = [0u8; 1];
-        let mut client_ref = client;
-        match client_ref.read(&mut probe) {
-            Ok(0) => {
-                let _ = wc.child.kill();
-                let _ = wc.child.wait();
-                break Err(anyhow!("remote client disconnected during --wait"));
-            }
-            Ok(_) => logging::warn("unexpected data from client during --wait; ignoring"),
-            Err(e)
-                if e.kind() == io::ErrorKind::WouldBlock
-                    || e.kind() == io::ErrorKind::TimedOut => {}
-            Err(e) => {
-                let _ = wc.child.kill();
-                let _ = wc.child.wait();
-                break Err(anyhow!("client connection failed during --wait: {e}"));
+
+        if client_fd >= 0 && fds[1].revents != 0 {
+            let mut probe = [0u8; 1];
+            let n = unsafe {
+                libc::recv(
+                    client_fd,
+                    probe.as_mut_ptr() as *mut libc::c_void,
+                    1,
+                    libc::MSG_PEEK,
+                )
+            };
+            if n == 0 {
+                // EOF: the client is gone. Stop the waiter CLI; its exit
+                // arrives on the socketpair next iteration.
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+                disconnected = true;
+                client_fd = -1;
+            } else if n > 0 {
+                // A pipelined frame. Leave it queued (MSG_PEEK consumed
+                // nothing) and stop watching readability so we don't spin.
+                logging::warn("client sent data during --wait; queued until the wait resolves");
+                client_fd = -1;
+            } else {
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::Interrupted {
+                    unsafe { libc::kill(pid, libc::SIGTERM) };
+                    disconnected = true;
+                    client_fd = -1;
+                }
             }
         }
-    };
-    // handle_client's frame loop expects a blocking socket.
-    let _ = client.set_read_timeout(None);
-    result
+    }
 }
 
 #[cfg(test)]

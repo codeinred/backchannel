@@ -313,7 +313,7 @@ fn handle_open(
         Ok(r) => r,
         Err(e) => return fail(stream, &e),
     };
-    let (alias, how) = resolve_alias(peer, &req.hostname);
+    let (alias, how) = resolve_alias(peer, &req);
     let args = launch::code_args(&alias, &req.action, req.window, req.wait);
     logging::info(format!(
         "{} from host '{}' (alias '{}' via {}) -> code {}",
@@ -366,9 +366,12 @@ fn describe(action: &Action) -> String {
     }
 }
 
-/// Best source first: the argv of the ssh process that carried the request,
-/// then the user's aliases file, then the hostname the remote reported.
-fn resolve_alias(peer: Option<peer::PeerInfo>, hostname: &str) -> (String, &'static str) {
+/// Best source first: the argv of the ssh process that carried the request
+/// (the alias exactly as typed), then the user's aliases file (keyed by the
+/// remote's hostname or its SSH_CONNECTION server IP), then a user@server_ip
+/// authority derived from SSH_CONNECTION — guaranteed reachable, since this
+/// very request rode over that endpoint — and only then the bare hostname.
+fn resolve_alias(peer: Option<peer::PeerInfo>, req: &OpenRequest) -> (String, &'static str) {
     if let Some(p) = peer {
         if let Some(argv) = peer::process_argv(p.pid) {
             if let Some(dest) = ssh_argv::destination(&argv) {
@@ -376,10 +379,60 @@ fn resolve_alias(peer: Option<peer::PeerInfo>, hostname: &str) -> (String, &'sta
             }
         }
     }
-    if let Some(alias) = alias_lookup(hostname) {
+    if let Some(alias) = alias_lookup(&req.hostname) {
         return (alias, "aliases file");
     }
-    (hostname.trim_end_matches('.').to_string(), "remote hostname")
+    let endpoint = parse_ssh_connection(&req.ssh_connection);
+    if let Some((ip, _)) = &endpoint {
+        if let Some(alias) = alias_lookup(ip) {
+            return (alias, "aliases file (by ip)");
+        }
+    }
+    if let Some((ip, port)) = endpoint {
+        let mut authority = String::new();
+        if !req.user.is_empty() {
+            authority.push_str(&req.user);
+            authority.push('@');
+        }
+        authority.push_str(&ip);
+        if port != 22 {
+            authority.push_str(&format!(":{port}"));
+        }
+        return (authority, "SSH_CONNECTION");
+    }
+    (
+        req.hostname.trim_end_matches('.').to_string(),
+        "remote hostname",
+    )
+}
+
+/// "client_ip client_port server_ip server_port" -> (server_ip, server_port)
+fn parse_ssh_connection(s: &str) -> Option<(String, u16)> {
+    let mut parts = s.split_whitespace();
+    let (_client_ip, _client_port) = (parts.next()?, parts.next()?);
+    let ip = parts.next()?;
+    let port: u16 = parts.next()?.parse().ok()?;
+    Some((ip.to_string(), port))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_ssh_connection;
+
+    #[test]
+    fn parses_ssh_connection() {
+        assert_eq!(
+            parse_ssh_connection("198.51.100.15 49263 203.0.113.26 22"),
+            Some(("203.0.113.26".into(), 22))
+        );
+        assert_eq!(
+            parse_ssh_connection("fe80::1 5 fe80::2 2222"),
+            Some(("fe80::2".into(), 2222))
+        );
+        assert_eq!(parse_ssh_connection(""), None);
+        assert_eq!(parse_ssh_connection("1.2.3.4 5 6.7.8.9"), None);
+        assert_eq!(parse_ssh_connection("1.2.3.4 5 6.7.8.9 notaport"), None);
+    }
 }
 
 fn alias_lookup(hostname: &str) -> Option<String> {

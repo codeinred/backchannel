@@ -208,12 +208,16 @@ fn send_plan(opts: OpenOptions) -> Result<()> {
         }
     }
 
+    let user = std::env::var("USER").unwrap_or_default();
+    let ssh_connection = std::env::var("SSH_CONNECTION").unwrap_or_default();
     for (action, msg) in requests {
         let req = OpenRequest {
             action,
             window: opts.window,
             wait: opts.wait,
             hostname: hostname.clone(),
+            user: user.clone(),
+            ssh_connection: ssh_connection.clone(),
         };
         write_frame(&mut stream, &extension(EXT_OPEN, &req.encode()))?;
         match read_reply(&mut stream)? {
