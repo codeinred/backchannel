@@ -1030,3 +1030,115 @@ fn replace_takes_over_and_shutdown_works() {
         std::thread::sleep(Duration::from_millis(25));
     }
 }
+
+// ---- install-as-code ----
+
+/// Sandbox for install-as-code tests: no daemon, just directories, a fake
+/// system `code`, and a controlled PATH/HOME for the child process.
+struct InstallEnv {
+    dir: PathBuf,
+}
+
+impl InstallEnv {
+    fn new(name: &str) -> InstallEnv {
+        let dir = std::env::temp_dir().join(format!("bci-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("home")).unwrap();
+        InstallEnv { dir }
+    }
+
+    fn home(&self) -> PathBuf {
+        self.dir.join("home")
+    }
+
+    /// A dir containing a fake (non-backchannel) `code`, like /usr/bin.
+    fn sys_dir(&self) -> PathBuf {
+        let d = self.dir.join("sys");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("code"), "#!/bin/sh\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(d.join("code"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        d
+    }
+
+    fn run(&self, args: &[&str], path_dirs: &[&Path]) -> std::process::Output {
+        Command::new(BIN)
+            .arg("install-as-code")
+            .args(args)
+            .env("PATH", std::env::join_paths(path_dirs.iter()).unwrap())
+            .env("HOME", self.home())
+            .output()
+            .unwrap()
+    }
+}
+
+impl Drop for InstallEnv {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+#[test]
+fn install_as_code_installs_and_verifies() {
+    let env = InstallEnv::new("ok");
+    let sys = env.sys_dir();
+    let bin = env.home().join("bin");
+
+    let out = env.run(&["--at", bin.to_str().unwrap()], &[&bin, &sys]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("resolves to the shim"), "stdout: {stdout}");
+    // The system `code` is reported as still reachable through delegation.
+    assert!(stdout.contains("stays reachable"), "stdout: {stdout}");
+    let target = std::fs::read_link(bin.join("code")).unwrap();
+    assert_eq!(target, Path::new(BIN).canonicalize().unwrap());
+
+    // --check agrees, from a fresh process with the same PATH.
+    let out = env.run(&["--check"], &[&bin, &sys]);
+    assert!(out.status.success());
+}
+
+#[test]
+fn install_as_code_warns_when_shadowed_and_suggests() {
+    let env = InstallEnv::new("shadowed");
+    let sys = env.sys_dir();
+    let bin = env.home().join("bin");
+    let early = env.home().join("early"); // on PATH ahead of sys, not yet created
+
+    let out = env.run(&["--at", bin.to_str().unwrap()], &[&early, &sys, &bin]);
+    // Install succeeds (exit 0); the shadowing is a warning, not an error.
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("resolves to"), "stderr: {stderr}");
+    assert!(
+        stderr.contains(&format!("--at {}", early.display())),
+        "stderr: {stderr}"
+    );
+
+    // --check is for scripts: shadowed means a nonzero exit.
+    let out = env.run(&["--check"], &[&early, &sys, &bin]);
+    assert!(!out.status.success());
+
+    // Following the suggestion fixes resolution.
+    let out = env.run(&["--at", early.to_str().unwrap()], &[&early, &sys, &bin]);
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("resolves to the shim"));
+    let out = env.run(&["--check"], &[&early, &sys, &bin]);
+    assert!(out.status.success());
+}
+
+#[test]
+fn install_as_code_respects_foreign_code_without_force() {
+    let env = InstallEnv::new("force");
+    let sys = env.sys_dir(); // sys/code is a foreign executable
+
+    let out = env.run(&["--at", sys.to_str().unwrap()], &[&sys]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("--force"));
+    // Untouched: still a regular file, not a symlink.
+    assert!(std::fs::symlink_metadata(sys.join("code")).unwrap().is_file());
+
+    let out = env.run(&["--at", sys.to_str().unwrap(), "--force"], &[&sys]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(std::fs::symlink_metadata(sys.join("code")).unwrap().is_symlink());
+}

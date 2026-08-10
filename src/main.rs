@@ -1,6 +1,7 @@
 mod clipboard;
 mod copy;
 mod daemon;
+mod install;
 mod launch;
 mod logging;
 mod open;
@@ -79,6 +80,19 @@ enum Command {
         /// File to copy; omit to read from stdin
         file: Option<String>,
     },
+    /// Install the `code` shim (a symlink to `back`) and check that it wins
+    /// `code` lookup on this shell's PATH
+    InstallAsCode {
+        /// Directory for the shim (default: alongside the `back` binary)
+        #[arg(long, value_name = "DIR")]
+        at: Option<std::path::PathBuf>,
+        /// Only diagnose what `code` resolves to; install nothing
+        #[arg(long, conflicts_with_all = ["at", "force"])]
+        check: bool,
+        /// Replace an existing `code` that is not a backchannel shim
+        #[arg(long)]
+        force: bool,
+    },
     /// Inspect or stop the daemon's ssh -L tunnels
     Proxy {
         #[command(subcommand)]
@@ -135,6 +149,7 @@ fn main() -> Result<()> {
                 paths,
             })
         }
+        Command::InstallAsCode { at, check, force } => install::run(at, check, force),
         Command::Open { proxy, targets } => open::run_open(targets, proxy),
         Command::Copy { file } => copy::run(file),
         Command::Proxy { action } => match action {
